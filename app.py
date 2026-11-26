@@ -260,6 +260,297 @@ def build_simulator_embed_html(ml_payload: Optional[Dict[str, Any]]) -> str:
     return inject_script + html_text
 
 
+def apply_sage_theme_css() -> None:
+    """public/simulator.html의 연회색·세이지(#eef2ef ~ #f3f6f2) 톤과 Streamlit UI를 자연스럽게 통일"""
+    st.markdown(
+        """
+        <style>
+        :root {
+            --sage-bg: #eef2ef;
+            --sage-bg-soft: #f1f4f1;
+            --sage-surface: #f6f8f6;
+            --sage-surface-alt: #e6ede8;
+            --sage-border: #dce3de;
+            --sage-border-strong: #c6d3ca;
+            --sage-ink: #1f2924;
+            --sage-muted: #55665d;
+            --sage-forest: #143f33;
+            --sage-emerald: #1c674e;
+            --sage-emerald-hover: #14503c;
+        }
+
+        /* 1. 전체 메인 배경 및 상단 헤더/데코레이션 */
+        html, body, .stApp,
+        [data-testid="stApp"],
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewBlockContainer"],
+        [data-testid="stMain"],
+        .main {
+            background-color: var(--sage-bg) !important;
+            color: var(--sage-ink);
+        }
+
+        header[data-testid="stHeader"] {
+            background-color: rgba(238, 242, 239, 0.92) !important;
+            backdrop-filter: blur(6px);
+            border-bottom: 1px solid var(--sage-border);
+        }
+
+        [data-testid="stDecoration"] {
+            background-image: linear-gradient(90deg, #143f33, #1c674e, #2c8055) !important;
+            height: 3px !important;
+        }
+
+        .main .block-container {
+            padding-top: 2.1rem;
+            padding-bottom: 1.75rem;
+        }
+
+        /* 2. 타이포그래피 및 구분선 */
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4 {
+            color: var(--sage-forest);
+            letter-spacing: -0.015em;
+        }
+        .stApp p, .stApp li, .stApp label,
+        [data-testid="stMarkdownContainer"] {
+            color: var(--sage-ink);
+        }
+        [data-testid="stCaptionContainer"], .stApp small {
+            color: var(--sage-muted) !important;
+        }
+        .stApp hr {
+            border-color: var(--sage-border) !important;
+        }
+
+        /* 3. 사이드바 영역 */
+        section[data-testid="stSidebar"],
+        section[data-testid="stSidebar"] > div:first-child,
+        [data-testid="stSidebarContent"] {
+            background-color: var(--sage-surface) !important;
+            border-right: 1px solid var(--sage-border);
+            color: var(--sage-ink);
+        }
+
+        /* 4. 입력 위젯 (number_input, text_input 등) */
+        [data-baseweb="input"],
+        [data-baseweb="base-input"],
+        [data-testid="stNumberInputContainer"] {
+            background-color: #f8faf8 !important;
+            border: 1px solid var(--sage-border-strong) !important;
+            border-radius: 8px !important;
+            color: var(--sage-ink) !important;
+        }
+        [data-baseweb="input"] input,
+        [data-baseweb="base-input"] input {
+            background-color: transparent !important;
+            color: var(--sage-ink) !important;
+        }
+        [data-testid="stNumberInputStepDown"],
+        [data-testid="stNumberInputStepUp"] {
+            background-color: var(--sage-bg) !important;
+            color: var(--sage-ink) !important;
+            border-left: 1px solid var(--sage-border) !important;
+        }
+        [data-testid="stNumberInputStepDown"]:hover,
+        [data-testid="stNumberInputStepUp"]:hover {
+            background-color: var(--sage-surface-alt) !important;
+        }
+
+        /* 5. 탭(st.tabs) */
+        [data-baseweb="tab-list"] {
+            gap: 8px;
+            border-bottom: 1px solid var(--sage-border-strong);
+            padding-bottom: 0;
+        }
+        [data-baseweb="tab"] {
+            background-color: var(--sage-surface-alt) !important;
+            color: #36473e !important;
+            border: 1px solid var(--sage-border) !important;
+            border-bottom: none !important;
+            border-radius: 10px 10px 0 0 !important;
+            padding: 8px 16px !important;
+            font-weight: 600 !important;
+            transition: background-color 0.15s ease, color 0.15s ease;
+        }
+        [data-baseweb="tab"]:hover {
+            background-color: #dde6df !important;
+            color: var(--sage-forest) !important;
+        }
+        [data-baseweb="tab"][aria-selected="true"] {
+            background-color: var(--sage-surface) !important;
+            color: var(--sage-forest) !important;
+            border-color: var(--sage-border-strong) !important;
+            font-weight: 700 !important;
+        }
+        [data-baseweb="tab-highlight"] {
+            background-color: var(--sage-emerald) !important;
+            height: 3px !important;
+        }
+        [data-baseweb="tab-border"] {
+            background-color: var(--sage-border) !important;
+        }
+
+        /* 6. Expander (안내 박스, 상세 미리보기, 로그, 테이블) */
+        [data-testid="stExpander"],
+        [data-testid="stExpander"] details {
+            background-color: var(--sage-surface) !important;
+            border: 1px solid var(--sage-border) !important;
+            border-radius: 12px !important;
+            box-shadow: 0 1px 2px rgba(20, 63, 51, 0.03);
+        }
+        [data-testid="stExpander"] summary {
+            background-color: var(--sage-surface) !important;
+            color: var(--sage-ink) !important;
+            border-radius: 12px !important;
+            font-weight: 600;
+        }
+        [data-testid="stExpander"] summary:hover {
+            background-color: var(--sage-bg-soft) !important;
+            color: var(--sage-forest) !important;
+        }
+
+        /* 7. 파일 업로더 (st.file_uploader) */
+        [data-testid="stFileUploaderDropzone"] {
+            background-color: var(--sage-surface) !important;
+            border: 1.5px dashed #b4c4b9 !important;
+            border-radius: 12px !important;
+            color: var(--sage-ink) !important;
+            transition: background-color 0.15s ease, border-color 0.15s ease;
+        }
+        [data-testid="stFileUploaderDropzone"]:hover {
+            background-color: #eaf1ec !important;
+            border-color: var(--sage-emerald) !important;
+        }
+        [data-testid="stFileUploaderDropzone"] small,
+        [data-testid="stFileUploaderDropzone"] span {
+            color: var(--sage-muted) !important;
+        }
+        [data-testid="stFileUploaderDropzone"] button {
+            background-color: var(--sage-bg) !important;
+            color: var(--sage-ink) !important;
+            border: 1px solid var(--sage-border-strong) !important;
+            border-radius: 8px !important;
+            font-weight: 600 !important;
+        }
+        [data-testid="stFileUploaderDropzone"] button:hover {
+            background-color: var(--sage-surface-alt) !important;
+            border-color: var(--sage-emerald) !important;
+            color: var(--sage-forest) !important;
+        }
+        [data-testid="stFileUploaderFile"] {
+            background-color: var(--sage-surface) !important;
+            border: 1px solid var(--sage-border) !important;
+            border-radius: 8px !important;
+            padding: 4px 10px !important;
+        }
+
+        /* 8. 버튼 (Primary / Secondary / Download) */
+        button[kind="primary"],
+        [data-testid="baseButton-primary"] {
+            background-color: var(--sage-emerald) !important;
+            border: 1px solid var(--sage-forest) !important;
+            color: #ffffff !important;
+            border-radius: 9px !important;
+            font-weight: 700 !important;
+        }
+        button[kind="primary"] *,
+        [data-testid="baseButton-primary"] * {
+            color: #ffffff !important;
+        }
+        button[kind="primary"]:hover:not(:disabled),
+        [data-testid="baseButton-primary"]:hover:not(:disabled) {
+            background-color: var(--sage-emerald-hover) !important;
+            border-color: #0e2e25 !important;
+        }
+
+        button[kind="secondary"],
+        [data-testid="baseButton-secondary"],
+        [data-testid="stDownloadButton"] button {
+            background-color: var(--sage-surface) !important;
+            border: 1px solid var(--sage-border-strong) !important;
+            color: var(--sage-ink) !important;
+            border-radius: 9px !important;
+            font-weight: 600 !important;
+        }
+        button[kind="secondary"]:hover:not(:disabled),
+        [data-testid="baseButton-secondary"]:hover:not(:disabled),
+        [data-testid="stDownloadButton"] button:hover:not(:disabled) {
+            background-color: var(--sage-surface-alt) !important;
+            border-color: var(--sage-emerald) !important;
+            color: var(--sage-forest) !important;
+        }
+
+        /* 9. 지표 카드(st.metric), 알림(st.alert), 데이터프레임, 코드 블록 */
+        [data-testid="stMetric"] {
+            background-color: var(--sage-surface) !important;
+            border: 1px solid var(--sage-border) !important;
+            border-radius: 10px !important;
+            padding: 12px 14px !important;
+            box-shadow: 0 1px 2px rgba(20, 63, 51, 0.03);
+        }
+        [data-testid="stMetricLabel"] {
+            color: var(--sage-muted) !important;
+        }
+        [data-testid="stMetricValue"] {
+            color: var(--sage-forest) !important;
+        }
+
+        [data-testid="stAlert"] {
+            border-radius: 10px !important;
+            border: 1px solid var(--sage-border) !important;
+        }
+
+        [data-testid="stDataFrame"],
+        [data-testid="stCode"],
+        [data-testid="stJson"] {
+            background-color: var(--sage-surface) !important;
+            border: 1px solid var(--sage-border) !important;
+            border-radius: 10px !important;
+            overflow: hidden;
+        }
+
+        /* 10. 시뮬레이터(simulator.html) 임베드 프레임 조화 */
+        [data-testid="stIFrame"],
+        [data-testid="stCustomComponentV1"] iframe,
+        iframe[title*="streamlit_components"],
+        iframe[srcdoc] {
+            background-color: #f3f6f2 !important;
+            border: 1px solid #cfd9d2 !important;
+            border-radius: 14px !important;
+            box-shadow: 0 2px 10px rgba(20, 63, 51, 0.06);
+        }
+
+        /* 11. 상단 타이틀 배너 (simulator.html <header>와 동일 톤) */
+        .app-hero-banner {
+            background-color: var(--sage-forest) !important;
+            color: #ffffff !important;
+            padding: 18px 24px;
+            border-radius: 14px;
+            border-bottom: 4px solid #2c8055;
+            margin-bottom: 14px;
+            box-shadow: 0 2px 10px rgba(20, 63, 51, 0.12);
+        }
+        .app-hero-banner .app-hero-sub {
+            color: #c2d7cb !important;
+            font-size: 12.5px;
+            line-height: 1.45;
+            margin: 0 0 4px 0;
+        }
+        .app-hero-banner .app-hero-title {
+            color: #ffffff !important;
+            font-size: clamp(1.35rem, 2.2vw, 1.85rem);
+            font-weight: 700;
+            line-height: 1.3;
+            letter-spacing: -0.3px;
+            margin: 0;
+            padding: 0;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ==============================================================================
 # Streamlit UI 구성
 # ==============================================================================
@@ -268,10 +559,18 @@ st.set_page_config(
     page_icon="🍅",
     layout="wide",
 )
+apply_sage_theme_css()
 ensure_session_state()
 
-st.title("🍅 토마토 스마트팜 ML 학습 및 수확량 예측 시뮬레이터")
-st.caption("여러 개의 CSV · 엑셀(.xlsx, .xls) 실측 파일을 업로드하고 버튼 한 번으로 머신러닝 학습 및 시뮬레이터 연동을 실행합니다.")
+st.markdown(
+    """
+    <div class="app-hero-banner">
+        <div class="app-hero-sub">여러 개의 CSV · 엑셀(.xlsx, .xls) 실측 파일을 업로드하고 버튼 한 번으로 머신러닝 학습 및 시뮬레이터 연동을 실행합니다.</div>
+        <h1 class="app-hero-title">🍅 토마토 스마트팜 ML 학습 및 수확량 예측 시뮬레이터</h1>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.expander("ℹ️ Streamlit Cloud 이용 안내 (파일 유지 및 저장 방법)", expanded=False):
     st.markdown(
