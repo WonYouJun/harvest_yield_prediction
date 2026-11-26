@@ -56,6 +56,7 @@ DAY_SEC = 86400
 PYEONG_TO_M2 = 3.305785
 DEFAULT_BASE_EFF = 8.0
 PAR_FACTOR_DEFAULT = 2.08
+DEFAULT_CALIB_DIR = "data/calib_csv"
 
 FEATURES = [
     "ma_3week",
@@ -1238,6 +1239,646 @@ def parse_calib_csv_into_rows(
 
 
 # ==============================================================================
+# 5-B. 로컬 다중 실측 CSV 폴더 스캔 · 유연한 컬럼 매핑 · 중복 제거 · 병합 로더
+# ==============================================================================
+CALIB_EXACT_ALIASES: Dict[str, str] = {
+    # 구역/작기/실험 식별자
+    "zone_id": "zone_id",
+    "zoneid": "zone_id",
+    "zone": "zone_id",
+    "구역": "zone_id",
+    "구역id": "zone_id",
+    "구역명": "zone_id",
+    "작기": "zone_id",
+    "season": "zone_id",
+    "plot": "zone_id",
+    "house": "zone_id",
+    "온실": "zone_id",
+    "실험구": "zone_id",
+    # 주차/시점
+    "week_no": "week_no",
+    "weekno": "week_no",
+    "week": "week_no",
+    "주차": "week_no",
+    "주": "week_no",
+    "wk": "week_no",
+    "date": "date",
+    "start": "date",
+    "startdate": "date",
+    "일자": "date",
+    "날짜": "date",
+    "시작일": "date",
+    "수확일": "date",
+    # 타깃: 실측 수확량
+    "y_actual": "y_actual",
+    "yactual": "y_actual",
+    "obs_kg": "y_actual",
+    "obskg": "y_actual",
+    "실측수확량": "y_actual",
+    "실측수확량(kg/m2)": "y_actual",
+    "실측수확량(kg/㎡)": "y_actual",
+    "실측수확": "y_actual",
+    "실측수확(kg/㎡)": "y_actual",
+    "yield_actual": "y_actual",
+    "yieldactual": "y_actual",
+    "actual_yield": "y_actual",
+    "actualyield": "y_actual",
+    "obs_yield": "y_actual",
+    "수확량": "y_actual",
+    "실측": "y_actual",
+    # 실측 보조 관측치
+    "obs_mass": "obs_mass",
+    "obsmass": "obs_mass",
+    "실측단과중": "obs_mass",
+    "실측단과중(g)": "obs_mass",
+    "단과중": "obs_mass",
+    "obs_mj": "mj_out",
+    "obsmj": "mj_out",
+    "실측외부일사": "mj_out",
+    "실측외부일사(mj/m2/일)": "mj_out",
+    "실측일사": "mj_out",
+    "obs_t24": "t_mean",
+    "obst24": "t_mean",
+    "실측t24": "t_mean",
+    "실측t24(c)": "t_mean",
+    "실측t24(℃)": "t_mean",
+    # 주요 환경/생육 변수
+    "dli_daily": "dli_daily",
+    "dlidaily": "dli_daily",
+    "dli": "dli_daily",
+    "solar_dli": "dli_daily",
+    "solardli": "dli_daily",
+    "총dli": "dli_daily",
+    "평균총dli": "dli_daily",
+    "nat_dli": "nat_dli",
+    "natdli": "nat_dli",
+    "자연광dli": "nat_dli",
+    "자연dli": "nat_dli",
+    "add_dli": "add_dli",
+    "adddli": "add_dli",
+    "보광dli": "add_dli",
+    "mj_out": "mj_out",
+    "mjout": "mj_out",
+    "rad_mj": "mj_out",
+    "radmj": "mj_out",
+    "외부일사": "mj_out",
+    "실외일사": "mj_out",
+    "실외일사(mj/㎡/일)": "mj_out",
+    "eff_w": "eff_w",
+    "effw": "eff_w",
+    "eff": "eff_w",
+    "광효율": "eff_w",
+    "주별광효율": "eff_w",
+    "t_mean": "t_mean",
+    "tmean": "t_mean",
+    "t24": "t_mean",
+    "t24(℃)": "t_mean",
+    "평균온도": "t_mean",
+    "일평균온도": "t_mean",
+    "평균기온": "t_mean",
+    "t_day": "t_day",
+    "tday": "t_day",
+    "주간온도": "t_day",
+    "t_night": "t_night",
+    "tnight": "t_night",
+    "야간온도": "t_night",
+    "dif": "dif",
+    "주야간온도차": "dif",
+    "vpd_mean": "vpd_mean",
+    "vpdmean": "vpd_mean",
+    "vpd": "vpd_mean",
+    "vpd(kpa)": "vpd_mean",
+    "rh_mean": "rh_mean",
+    "rhmean": "rh_mean",
+    "rh": "rh_mean",
+    "상대습도": "rh_mean",
+    "상대습도(%)": "rh_mean",
+    "습도": "rh_mean",
+    "co2_mean": "co2_mean",
+    "co2mean": "co2_mean",
+    "co2": "co2_mean",
+    "co2(ppm)": "co2_mean",
+    "rtr": "rtr",
+    "k_vpd": "k_vpd",
+    "kvpd": "k_vpd",
+    "k_temp": "k_temp",
+    "ktemp": "k_temp",
+    "k_co2": "k_co2",
+    "kco2": "k_co2",
+    "k_light": "k_light",
+    "klight": "k_light",
+    "k_total": "k_total",
+    "ktotal": "k_total",
+    "dyn_lag": "dyn_lag",
+    "dynlag": "dyn_lag",
+    "lag": "dyn_lag",
+    "동적성숙lag": "dyn_lag",
+    "sink_part": "sink_part",
+    "sinkpart": "sink_part",
+    "초기분배율": "sink_part",
+    "ss_ratio": "ss_ratio",
+    "ssratio": "ss_ratio",
+    "fruit_load": "fruit_load",
+    "fruitload": "fruit_load",
+    "착과부하": "fruit_load",
+    "cum_p_n_8w": "cum_p_n_8w",
+    "cumpn8w": "cum_p_n_8w",
+    "tr_ratio": "tr_ratio",
+    "trratio": "tr_ratio",
+    "ma_3week": "ma_3week",
+    "ma3week": "ma_3week",
+    "3주이동평균": "ma_3week",
+    "orig_kg_sim": "orig_kg_sim",
+    "orig_kg": "orig_kg_sim",
+    "원본수확": "orig_kg_sim",
+    "adj_kg_sim": "adj_kg_sim",
+    "adj_kg": "adj_kg_sim",
+    "보정수확": "adj_kg_sim",
+}
+
+CALIB_BASE_ALIASES: Dict[str, str] = {
+    re.sub(r"\([^)]*\)", "", k): v for k, v in CALIB_EXACT_ALIASES.items()
+}
+
+RICH_FEATURE_KEYS = {
+    "dli_daily", "nat_dli", "add_dli", "t_day", "t_night", "dif",
+    "vpd_mean", "rh_mean", "co2_mean", "cum_p_n_8w", "tr_ratio",
+    "fruit_load", "ma_3week", "k_total", "ss_ratio", "orig_kg_sim", "adj_kg_sim",
+}
+
+
+def _normalize_header_token(name: str) -> str:
+    return re.sub(r"[\s_\-]+", "", str(name).strip().lstrip("\ufeff").lower())
+
+
+def _resolve_calib_column_name(header: str) -> Optional[str]:
+    exact_tok = _normalize_header_token(header)
+    if not exact_tok:
+        return None
+    if exact_tok in CALIB_EXACT_ALIASES:
+        return CALIB_EXACT_ALIASES[exact_tok]
+    base_tok = _normalize_header_token(re.sub(r"\([^)]*\)", "", header))
+    if base_tok in CALIB_BASE_ALIASES:
+        return CALIB_BASE_ALIASES[base_tok]
+    return None
+
+
+def _split_csv_row(line: str) -> List[str]:
+    if "\t" in line or (";" in line and "," not in line):
+        return [p.strip().strip('"') for p in re.split(r"[\t;]+", line)]
+    return [p.strip().strip('"') for p in next(csv.reader([line]))]
+
+
+def _sanitize_calib_numeric(field: str, val: Optional[float]) -> Optional[float]:
+    if val is None or not math.isfinite(val):
+        return None
+    if field in ("y_actual", "obs_mass", "mj_out", "dli_daily", "nat_dli", "add_dli", "eff_w", "vpd_mean", "orig_kg_sim", "adj_kg_sim", "ma_3week", "cum_p_n_8w", "fruit_load"):
+        if val < 0.0:
+            return None
+    if field == "rh_mean" and not (0.0 <= val <= 100.0):
+        return None
+    if field == "co2_mean" and val <= 0.0:
+        return None
+    if field == "t_mean" and not (-20.0 <= val <= 60.0):
+        return None
+    return float(val)
+
+
+def parse_flexible_calib_csv(
+    csv_path: Path,
+    source_label: Optional[str] = None,
+    default_zone: str = "Zone_A",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    다중 실측 CSV 폴더 내 개별 CSV 파일을 유연하게 파싱한다.
+    지원 형식:
+      1) 헤더가 있는 실측/환경 CSV (영문/한글 별칭 컬럼 자동 매핑)
+      2) HTML [CSV 양식 받기] 6컬럼 및 붙여넣기 2~5컬럼(헤더 유무 모두 지원)
+      3) HTML [마스터플랜 CSV 다운로드] 파일
+    기상청 ASOS / Open-Meteo 전용 파일처럼 수확 실측·주차 컬럼이 없는 파일은 안전하게 건너뛴다.
+    """
+    src_name = source_label or csv_path.name
+    text = decode_text_auto(csv_path)
+    raw_lines = [ln for ln in text.splitlines() if ln.strip()]
+    stats = {"source_file": src_name, "raw_rows": 0, "skipped_invalid": 0, "kind": "unknown"}
+    if not raw_lines:
+        return [], stats
+
+    # 마스터플랜 CSV 형식 감지
+    head_preview = "\n".join(raw_lines[:35])
+    if "[주별 세부 광량" in head_preview and "온실환경연구실 토마토" in head_preview:
+        try:
+            mp = load_masterplan_csv(csv_path)
+            stats["kind"] = "masterplan_csv"
+            periods = plan_periods(str(mp["config"]["start"]), str(mp["config"]["harvestEnd"]))
+            records: List[Dict[str, Any]] = []
+            for idx, (wr, cb) in enumerate(zip(mp["week_rows"], mp["calib_rows"])):
+                y_act = _sanitize_calib_numeric("y_actual", cb.get("obsKg"))
+                if y_act is None:
+                    continue
+                wk_date = periods[idx]["at"].isoformat() if idx < len(periods) else None
+                records.append({
+                    "zone_id": mp["zone_label"] or default_zone,
+                    "week_no": idx + 1,
+                    "date": wk_date,
+                    "y_actual": y_act,
+                    "mj_out": _sanitize_calib_numeric("mj_out", wr.get("mj")),
+                    "eff_w": _sanitize_calib_numeric("eff_w", wr.get("eff")),
+                    "dyn_lag": _sanitize_calib_numeric("dyn_lag", wr.get("lag")),
+                    "t_mean": _sanitize_calib_numeric("t_mean", cb.get("obsT24")),
+                    "_source_file": src_name,
+                    "_has_rich_features": False,
+                })
+            stats["raw_rows"] = len(records)
+            return records, stats
+        except Exception:
+            pass
+
+    # Open-Meteo / ASOS 기상 관측 CSV는 실측 수확량 폴더에서 오인 파싱되지 않도록 스킵
+    first_cols_joined = ",".join(_split_csv_row(raw_lines[0])).lower()
+    if ("latitude" in first_cols_joined and "longitude" in first_cols_joined) or (
+        ("지점명" in raw_lines[0] or "shortwave_radiation_sum" in first_cols_joined)
+        and "수확" not in head_preview
+        and "y_actual" not in head_preview.lower()
+        and "obs_kg" not in head_preview.lower()
+    ):
+        stats["kind"] = "weather_csv_skipped"
+        return [], stats
+
+    first_cells = _split_csv_row(raw_lines[0])
+    mapped_headers: List[Optional[str]] = [_resolve_calib_column_name(c) for c in first_cells]
+    has_header = any(m is not None for m in mapped_headers)
+
+    # 헤더가 없고 첫 줄이 숫자(주차) 또는 날짜로 시작하면 2~5컬럼/6컬럼 무헤더 포맷으로 처리
+    records_out: List[Dict[str, Any]] = []
+    start_row_idx = 1 if has_header else 0
+    if not has_header:
+        p0 = first_cells[0] if first_cells else ""
+        if to_float(re.sub(r"[^0-9.-]", "", p0)) is None and normalize_weather_date(p0) is None:
+            start_row_idx = 1  # 알 수 없는 텍스트 헤더 행 스킵
+
+    mapped_rich = set(m for m in mapped_headers if m in RICH_FEATURE_KEYS)
+    stats["kind"] = "header_mapped" if has_header else "positional"
+
+    for row_line in raw_lines[start_row_idx:]:
+        cells = _split_csv_row(row_line)
+        if not cells or all(c == "" for c in cells):
+            continue
+        stats["raw_rows"] += 1
+        rec: Dict[str, Any] = {
+            "zone_id": None,
+            "week_no": None,
+            "date": None,
+            "y_actual": None,
+            "_source_file": src_name,
+            "_has_rich_features": bool(mapped_rich),
+        }
+
+        if has_header:
+            for col_idx, canon in enumerate(mapped_headers):
+                if canon is None or col_idx >= len(cells):
+                    continue
+                raw_val = cells[col_idx].strip()
+                if not raw_val:
+                    continue
+                if canon == "zone_id":
+                    rec["zone_id"] = raw_val
+                elif canon == "date":
+                    d_norm = normalize_weather_date(raw_val)
+                    if d_norm:
+                        rec["date"] = d_norm
+                elif canon == "week_no":
+                    wn_num = to_float(re.sub(r"[^0-9.-]", "", raw_val))
+                    if wn_num is not None and int(round(wn_num)) >= 1:
+                        rec["week_no"] = int(round(wn_num))
+                else:
+                    num_val = _sanitize_calib_numeric(canon, to_float(raw_val))
+                    if num_val is not None:
+                        rec[canon] = num_val
+        else:
+            if len(cells) < 2:
+                stats["skipped_invalid"] += 1
+                continue
+            p0 = cells[0]
+            d_norm0 = normalize_weather_date(p0)
+            if d_norm0:
+                rec["date"] = d_norm0
+            else:
+                wn_str = re.sub(r"[^0-9-]", "", p0)
+                wn_val = to_float(wn_str)
+                if wn_val is not None and int(round(wn_val)) >= 1:
+                    rec["week_no"] = int(round(wn_val))
+            offset = 1 if (len(cells) >= 3 and normalize_weather_date(cells[1]) is not None) else 0
+            if offset == 1 and rec["date"] is None:
+                rec["date"] = normalize_weather_date(cells[1])
+            pos_fields = ("y_actual", "obs_mass", "mj_out", "t_mean")
+            for k_offset, fname in enumerate(pos_fields):
+                c_idx = 1 + offset + k_offset
+                if c_idx < len(cells):
+                    val = _sanitize_calib_numeric(fname, to_float(cells[c_idx]))
+                    if val is not None:
+                        rec[fname] = val
+
+        # 유효 시점 및 최소 관측치 검증
+        if rec["week_no"] is None and rec["date"] is None:
+            stats["skipped_invalid"] += 1
+            continue
+        has_useful_val = any(
+            rec.get(k) is not None
+            for k in ("y_actual", "obs_mass", "mj_out", "t_mean", "dli_daily", "adj_kg_sim", "orig_kg_sim")
+        )
+        if not has_useful_val:
+            stats["skipped_invalid"] += 1
+            continue
+
+        if not rec["zone_id"]:
+            rec["zone_id"] = default_zone
+        records_out.append(rec)
+
+    return records_out, stats
+
+
+def merge_and_deduplicate_calib_records(
+    records: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    다중 CSV에서 수집된 레코드를 (zone_id, date 또는 week_no) 키로 중복 정리한다.
+    정렬 순서(파일명 순 -> 행 순) 기준 뒤쪽(최신) 파일 값으로 병합/갱신한다.
+    """
+    merged_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    ordered_keys: List[Tuple[str, str]] = []
+    duplicate_count = 0
+
+    for rec in records:
+        z_key = str(rec.get("zone_id") or "Zone_A").strip()
+        if rec.get("date"):
+            t_key = f"d:{rec['date']}"
+        elif rec.get("week_no") is not None:
+            t_key = f"w:{int(rec['week_no'])}"
+        else:
+            continue
+
+        key = (z_key, t_key)
+        if key not in merged_map:
+            merged_map[key] = dict(rec)
+            ordered_keys.append(key)
+        else:
+            duplicate_count += 1
+            existing = merged_map[key]
+            for fld, val in rec.items():
+                if fld.startswith("_"):
+                    continue
+                if val is not None:
+                    existing[fld] = val
+            existing["_source_file"] = rec.get("_source_file", existing.get("_source_file"))
+            existing["_has_rich_features"] = bool(existing.get("_has_rich_features") or rec.get("_has_rich_features"))
+
+    merged_list = [merged_map[k] for k in ordered_keys]
+
+    # 구역별로 날짜/주차 오름차순 정렬 및 누락 week_no 보완
+    by_zone: Dict[str, List[Dict[str, Any]]] = {}
+    for item in merged_list:
+        by_zone.setdefault(str(item["zone_id"]), []).append(item)
+
+    final_sorted: List[Dict[str, Any]] = []
+    for z_name in sorted(by_zone.keys()):
+        z_items = by_zone[z_name]
+        z_items.sort(key=lambda r: (
+            str(r.get("date") or "9999-99-99"),
+            int(r.get("week_no") if r.get("week_no") is not None else 10**9),
+        ))
+        dated_vals = [parse_date(r["date"]) for r in z_items if r.get("date")]
+        min_dt = min(dated_vals) if dated_vals else None
+        for seq_idx, r in enumerate(z_items):
+            if r.get("week_no") is None:
+                if r.get("date") and min_dt is not None:
+                    r["week_no"] = ((parse_date(r["date"]) - min_dt).days // 7) + 1
+                else:
+                    r["week_no"] = seq_idx + 1
+            final_sorted.append(r)
+
+    return final_sorted, duplicate_count
+
+
+def load_calib_dir_records(
+    calib_dir: Path,
+    recursive: bool = False,
+    default_zone: str = "Zone_A",
+) -> Dict[str, Any]:
+    """지정 폴더(기본: data/calib_csv/)의 모든 CSV를 정렬 순서로 스캔·병합한다."""
+    if not calib_dir.exists() or not calib_dir.is_dir():
+        return {
+            "exists": False,
+            "calib_dir": str(calib_dir),
+            "files_found": [],
+            "files_used": [],
+            "records": [],
+            "raw_rows": 0,
+            "merged_rows": 0,
+            "duplicates_merged": 0,
+            "valid_obs_count": 0,
+            "zones": [],
+        }
+
+    pattern_iter = calib_dir.rglob("*") if recursive else calib_dir.iterdir()
+    csv_files = sorted(
+        [p for p in pattern_iter if p.is_file() and p.suffix.lower() == ".csv"],
+        key=lambda p: p.relative_to(calib_dir).as_posix().lower(),
+    )
+
+    all_raw_records: List[Dict[str, Any]] = []
+    files_used: List[str] = []
+    raw_rows_total = 0
+
+    for p in csv_files:
+        rel_name = p.relative_to(calib_dir).as_posix()
+        try:
+            recs, st = parse_flexible_calib_csv(p, source_label=rel_name, default_zone=default_zone)
+            raw_rows_total += st["raw_rows"]
+            if recs:
+                files_used.append(rel_name)
+                all_raw_records.extend(recs)
+        except Exception as exc:
+            print(f"[경고] '{rel_name}' 파싱 중 오류가 발생하여 건너뜁니다: {exc}")
+
+    merged_records, dup_cnt = merge_and_deduplicate_calib_records(all_raw_records)
+    valid_obs_cnt = sum(1 for r in merged_records if r.get("y_actual") is not None)
+    zones = sorted({str(r["zone_id"]) for r in merged_records if r.get("zone_id")})
+
+    return {
+        "exists": True,
+        "calib_dir": str(calib_dir),
+        "files_found": [p.relative_to(calib_dir).as_posix() for p in csv_files],
+        "files_used": files_used,
+        "records": merged_records,
+        "raw_rows": raw_rows_total,
+        "merged_rows": len(merged_records),
+        "duplicates_merged": dup_cnt,
+        "valid_obs_count": valid_obs_cnt,
+        "zones": zones,
+    }
+
+
+def apply_calib_records_to_periods(
+    records: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    base_calib_rows: Optional[List[Dict[str, Optional[float]]]] = None,
+) -> Tuple[List[Dict[str, Optional[float]]], List[Dict[str, Any]]]:
+    """
+    수집·병합된 실측 레코드 중 현재 시뮬레이션 작기(periods)에 매칭되는 행을 calib_rows에 주입하고,
+    매칭되지 않은 나머지 타 구역/타 시점 레코드는 별도 리스트(unmatched)로 반환한다.
+    """
+    periods = plan_periods(str(config["start"]), str(config["harvestEnd"]))
+    out = _normalize_calib_rows(base_calib_rows, len(periods))
+    unmatched: List[Dict[str, Any]] = []
+
+    for rec in records:
+        w_idx = -1
+        if rec.get("date"):
+            dt = parse_date(str(rec["date"]))
+            for idx, p in enumerate(periods):
+                if p["at"] <= dt < p["at"] + timedelta(days=p["days"]):
+                    w_idx = idx
+                    break
+        elif rec.get("week_no") is not None:
+            wn = int(rec["week_no"])
+            if 1 <= wn <= len(periods):
+                w_idx = wn - 1
+
+        if w_idx < 0 or w_idx >= len(periods):
+            unmatched.append(rec)
+            continue
+
+        if rec.get("y_actual") is not None:
+            out[w_idx]["obsKg"] = float(rec["y_actual"])
+        if rec.get("obs_mass") is not None:
+            out[w_idx]["obsMass"] = float(rec["obs_mass"])
+        if rec.get("mj_out") is not None:
+            out[w_idx]["obsMj"] = float(rec["mj_out"])
+        if rec.get("t_mean") is not None:
+            out[w_idx]["obsT24"] = float(rec["t_mean"])
+
+    return out, unmatched
+
+
+def build_tabular_ml_rows(
+    records: List[Dict[str, Any]],
+    default_start_date: str = "2027-01-01",
+    weather_ds: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    다중 실측 CSV(환경·수확량 로그) 레코드를 구역(zone_id)별로 그룹핑하여
+    HTML 27개 피처(calc_physiology · 이동평균 ma_3week · 누적광합성 cum_p_n_8w) 규격으로 변환한다.
+    """
+    by_zone: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in records:
+        z_name = str(rec.get("zone_id") or "Zone_A")
+        by_zone.setdefault(z_name, []).append(rec)
+
+    all_out: List[Dict[str, Any]] = []
+    for z_name in sorted(by_zone.keys()):
+        z_recs = sorted(
+            by_zone[z_name],
+            key=lambda r: (str(r.get("date") or "9999-99-99"), int(r.get("week_no") or 0)),
+        )
+        start_dt = parse_date(str(z_recs[0]["date"])) if z_recs and z_recs[0].get("date") else parse_date(default_start_date)
+        y_hist: List[float] = []
+        pn_hist: List[float] = []
+
+        for idx, r in enumerate(z_recs):
+            wk = int(r.get("week_no") or (idx + 1))
+            wk_date = str(r.get("date") or (start_dt + timedelta(days=max(wk - 1, 0) * 7)).isoformat())
+            dt_obj = parse_date(wk_date)
+            m_idx = dt_obj.month - 1
+            env_fb = STANDARD_ENV_MONTHS[m_idx] if 0 <= m_idx < 12 else STANDARD_ENV_MONTHS[0]
+
+            mj_out = to_float(r.get("mj_out"))
+            if mj_out is None and weather_ds is not None:
+                if wk_date in weather_ds["daily"]:
+                    mj_out = weather_ds["daily"][wk_date]
+                elif wk_date[5:] in weather_ds["calFallback"]:
+                    mj_out = weather_ds["calFallback"][wk_date[5:]]
+                else:
+                    mj_out = weather_ds["monthly"][m_idx]
+
+            dli_daily = to_float(r.get("dli_daily"))
+            if dli_daily is None and mj_out is not None:
+                dli_daily = mj_out * PAR_FACTOR_DEFAULT * 0.70
+            if dli_daily is None:
+                mj_fb = DEFAULT_MONTHLY_MJ[m_idx] if 0 <= m_idx < 12 else 12.0
+                mj_out = mj_fb
+                dli_daily = mj_fb * PAR_FACTOR_DEFAULT * 0.70
+            if mj_out is None:
+                mj_out = dli_daily / (PAR_FACTOR_DEFAULT * 0.70)
+
+            t_mean = to_float(r.get("t_mean"), env_fb["temp"]) or env_fb["temp"]
+            t_day = to_float(r.get("t_day"), round(t_mean + 2.25, 1)) or round(t_mean + 2.25, 1)
+            t_night = to_float(r.get("t_night"), round(t_mean - 2.25, 1)) or round(t_mean - 2.25, 1)
+            dif = to_float(r.get("dif"), t_day - t_night) or (t_day - t_night)
+            rh_mean = to_float(r.get("rh_mean"), env_fb["rh"]) or env_fb["rh"]
+            co2_mean = to_float(r.get("co2_mean"), env_fb["co2"]) or env_fb["co2"]
+
+            phys = calc_physiology(t_mean, rh_mean, co2_mean, dif=dif, dli=dli_daily)
+            vpd_mean = to_float(r.get("vpd_mean"), phys["vpd"]) or phys["vpd"]
+            eff_w = to_float(r.get("eff_w"), DEFAULT_BASE_EFF) or DEFAULT_BASE_EFF
+            sink_part = to_float(r.get("sink_part"), 1.0) or 1.0
+            orig_sim = to_float(r.get("orig_kg_sim"), dli_daily * 7.0 * (eff_w / 1000.0) * sink_part) or 0.0
+            adj_sim = to_float(r.get("adj_kg_sim"), orig_sim * phys["ktotal"]) or 0.0
+
+            y_act = to_float(r.get("y_actual"))
+            ma_3 = to_float(r.get("ma_3week"))
+            if ma_3 is None:
+                ma_3 = sum(y_hist[-3:]) / len(y_hist[-3:]) if y_hist else float(adj_sim)
+
+            pn_hist.append(dli_daily * 0.65)
+            cum_pn_8w = to_float(r.get("cum_p_n_8w"), sum(pn_hist[-8:])) or sum(pn_hist[-8:])
+            y_hist.append(y_act if y_act is not None else float(adj_sim))
+
+            tr_default = clamp(0.75 + (vpd_mean - 0.95) * 0.08, 0.50, 1.00)
+            tr_ratio = to_float(r.get("tr_ratio"), tr_default) or tr_default
+
+            all_out.append({
+                "zone_id": z_name,
+                "_source_file": r.get("_source_file", ""),
+                "week": wk,
+                "week_no": wk,
+                "start": wk_date,
+                "date": wk_date,
+                "y_actual": y_act,
+                "orig_kg_sim": float(orig_sim),
+                "adj_kg_sim": float(adj_sim),
+                "has_harvest_potential": True,
+                "ma_3week": float(ma_3),
+                "dli_daily": float(dli_daily),
+                "nat_dli": float(to_float(r.get("nat_dli"), dli_daily) or dli_daily),
+                "add_dli": float(to_float(r.get("add_dli"), 0.0) or 0.0),
+                "mj_out": float(mj_out),
+                "eff_w": float(eff_w),
+                "t_day": float(t_day),
+                "t_night": float(t_night),
+                "t_mean": float(t_mean),
+                "dif": float(dif),
+                "rh_mean": float(rh_mean),
+                "vpd_mean": float(vpd_mean),
+                "co2_mean": float(co2_mean),
+                "rtr": float(to_float(r.get("rtr"), phys["rtr"]) or phys["rtr"]),
+                "k_vpd": float(to_float(r.get("k_vpd"), phys["kvpd"]) or phys["kvpd"]),
+                "k_temp": float(to_float(r.get("k_temp"), phys["ktemp"]) or phys["ktemp"]),
+                "k_co2": float(to_float(r.get("k_co2"), phys["kco2"]) or phys["kco2"]),
+                "k_light": float(to_float(r.get("k_light"), phys["klight"]) or phys["klight"]),
+                "k_total": float(to_float(r.get("k_total"), phys["ktotal"]) or phys["ktotal"]),
+                "dyn_lag": float(to_float(r.get("dyn_lag"), 45.0) or 45.0),
+                "sink_part": float(sink_part),
+                "ss_ratio": float(to_float(r.get("ss_ratio"), 1.0) or 1.0),
+                "fruit_load": float(to_float(r.get("fruit_load"), 1.0) or 1.0),
+                "cum_p_n_8w": float(cum_pn_8w),
+                "tr_ratio": float(tr_ratio),
+            })
+
+    return all_out
+
+
+# ==============================================================================
 # 6. HTML 시뮬레이터 결과 -> ML 피처 테이블 구축 (+ 기존 SQLite/CSV 폴백 지원)
 # ==============================================================================
 def build_ml_rows_from_simulation(
@@ -1538,20 +2179,30 @@ def fit_and_predict_ml(
     rows_ml: List[Dict[str, Any]],
     base_week: Optional[int],
     min_weeks: int,
+    extra_train_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    실측 주차로 RandomForestRegressor 학습 후 전체 작기(과거 적합 + 미래 순차 롤아웃) 예측 및 오차 지표 산출
+    실측 주차(+ 다중 폴더의 타 구역/타 시점 학습 데이터)로 RandomForestRegressor 학습 후
+    전체 작기(과거 적합 + 미래 순차 롤아웃) 예측 및 오차 지표 산출
     """
-    obs_weeks = [r for r in rows_ml if r["y_actual"] is not None]
-    if not obs_weeks:
-        raise ValueError("학습에 사용할 실측 수확량(y_actual / obsKg) 데이터가 없습니다.")
+    obs_target = [r for r in rows_ml if r["y_actual"] is not None]
+    extra_obs = [r for r in (extra_train_rows or []) if r.get("y_actual") is not None]
+    if not obs_target and not extra_obs:
+        raise ValueError("학습에 사용할 실측 수확량(y_actual / obsKg / 실측수확량) 데이터가 없습니다.")
 
-    resolved_base_week = base_week if base_week is not None else max(r["week"] for r in obs_weeks)
-    train_rows = [r for r in obs_weeks if r["week"] <= resolved_base_week]
+    if base_week is not None:
+        resolved_base_week = base_week
+    elif obs_target:
+        resolved_base_week = max(r["week"] for r in obs_target)
+    else:
+        resolved_base_week = max(r["week"] for r in extra_obs)
+
+    train_target = [r for r in obs_target if r["week"] <= resolved_base_week]
+    train_rows = train_target + extra_obs
     if len(train_rows) < min_weeks:
         raise ValueError(
-            f"학습 데이터가 부족합니다 ({len(train_rows)}주, 기준 주차 {resolved_base_week}주 이하). "
-            f"최소 {min_weeks}주 이상의 실측 데이터가 필요합니다 (--min-weeks 옵션으로 조정 가능)."
+            f"학습 데이터가 부족합니다 ({len(train_rows)}건, 기준 주차 {resolved_base_week}주 이하). "
+            f"최소 {min_weeks}개 이상의 실측 데이터가 필요합니다 (--min-weeks 옵션으로 조정 가능)."
         )
 
     def extract_matrix(items: List[Dict[str, Any]]) -> List[List[float]]:
@@ -1591,7 +2242,7 @@ def fit_and_predict_ml(
 
     # 전체 주차 예측 생성 (기준 주차 이전: 직접 피처 예측 / 이후: 물리 시뮬레이터 피처 + 이동평균 순차 롤아웃)
     last_train = train_rows[-1]
-    history_y = [float(r["y_actual"]) for r in train_rows]
+    history_y = [float(r["y_actual"]) for r in (train_target if train_target else train_rows)]
     predictions: List[Dict[str, Any]] = []
 
     abs_err_sum = 0.0
@@ -1603,7 +2254,7 @@ def fit_and_predict_ml(
         wk = int(r["week"])
         if not r.get("has_harvest_potential", True) and r["y_actual"] is None:
             y_hat = 0.0
-        elif wk <= resolved_base_week:
+        elif wk <= resolved_base_week or not obs_target:
             feat_map = {f: float(r.get(f, 0.0) or 0.0) for f in FEATURES}
             y_hat = max(0.0, predict_row(feat_map))
         else:
@@ -1642,14 +2293,28 @@ def fit_and_predict_ml(
             "dyn_lag": round(float(r["dyn_lag"]), 1),
         })
 
-    mae = round(abs_err_sum / obs_eval_cnt, 4) if obs_eval_cnt > 0 else None
-    rmse = round(math.sqrt(sq_err_sum / obs_eval_cnt), 4) if obs_eval_cnt > 0 else None
-    bias = round(bias_sum / obs_eval_cnt, 4) if obs_eval_cnt > 0 else None
+    # 대상 타임라인에 실측이 없는 미래 계획 예측인 경우 학습셋 오차 지표로 폴백
+    if obs_eval_cnt > 0:
+        mae = round(abs_err_sum / obs_eval_cnt, 4)
+        rmse = round(math.sqrt(sq_err_sum / obs_eval_cnt), 4)
+        bias = round(bias_sum / obs_eval_cnt, 4)
+    else:
+        tr_abs, tr_sq, tr_bias = 0.0, 0.0, 0.0
+        for tr_r in train_rows:
+            tr_pred = max(0.0, predict_row({f: float(tr_r.get(f, 0.0) or 0.0) for f in FEATURES}))
+            tr_err = round(tr_pred, 3) - float(tr_r["y_actual"])
+            tr_abs += abs(tr_err)
+            tr_sq += tr_err * tr_err
+            tr_bias += tr_err
+        mae = round(tr_abs / len(train_rows), 4)
+        rmse = round(math.sqrt(tr_sq / len(train_rows)), 4)
+        bias = round(tr_bias / len(train_rows), 4)
 
     metrics = {
         "model_name": model_name,
         "base_week": resolved_base_week,
-        "matched_obs_weeks": obs_eval_cnt,
+        "matched_obs_weeks": obs_eval_cnt if obs_eval_cnt > 0 else len(train_rows),
+        "train_samples": len(train_rows),
         "mae": mae,
         "rmse": rmse,
         "bias": bias,
@@ -1710,10 +2375,31 @@ def auto_discover_input() -> Tuple[Optional[str], Optional[Path]]:
     return None, None
 
 
+def _select_target_zone_from_records(records: List[Dict[str, Any]], requested_zone: Optional[str]) -> str:
+    zones = sorted({str(r.get("zone_id") or "Zone_A") for r in records})
+    if not zones:
+        return requested_zone or "Zone_A"
+    if requested_zone and requested_zone in zones:
+        return requested_zone
+    if len(zones) == 1:
+        return zones[0]
+
+    def zone_rank(z: str) -> Tuple[str, int, int, str]:
+        zr = [r for r in records if str(r.get("zone_id") or "") == z]
+        max_dt = max((str(r.get("date") or "") for r in zr), default="")
+        obs_cnt = sum(1 for r in zr if r.get("y_actual") is not None)
+        return (max_dt, obs_cnt, len(zr), z)
+
+    return max(zones, key=zone_rank)
+
+
 def run_pipeline(
     plan_path: Optional[str] = None,
     masterplan_csv_path: Optional[str] = None,
     calib_csv_path: Optional[str] = None,
+    calib_dir: Optional[str] = DEFAULT_CALIB_DIR,
+    no_calib_dir: bool = False,
+    calib_dir_recursive: bool = False,
     weather_csv_path: Optional[str] = None,
     weather_db_path: Optional[str] = None,
     station: Optional[str] = None,
@@ -1727,9 +2413,39 @@ def run_pipeline(
     harvest_end_date: str = "2027-12-31",
 ) -> Dict[str, Any]:
     plan_data: Optional[Dict[str, Any]] = None
+    extra_train_rows: List[Dict[str, Any]] = []
 
-    # 명시 입력이 전혀 없을 경우 현재 디렉토리 및 public/ 자동 탐색
-    if not any([plan_path, masterplan_csv_path, calib_csv_path]) and not (
+    # 1) 다중 실측 CSV 폴더 스캔 (--no-calib-dir 미지정 시)
+    dir_scan: Dict[str, Any] = {
+        "exists": False,
+        "calib_dir": calib_dir or "",
+        "files_found": [],
+        "files_used": [],
+        "records": [],
+        "raw_rows": 0,
+        "merged_rows": 0,
+        "duplicates_merged": 0,
+        "valid_obs_count": 0,
+        "zones": [],
+    }
+    if not no_calib_dir and calib_dir:
+        dir_scan = load_calib_dir_records(
+            Path(calib_dir),
+            recursive=calib_dir_recursive,
+            default_zone=zone_id or "Zone_A",
+        )
+        if dir_scan["files_used"]:
+            print(
+                f"[실측 폴더 스캔] '{dir_scan['calib_dir']}' | 사용 CSV {len(dir_scan['files_used'])}개 "
+                f"({', '.join(dir_scan['files_used'])}) | 원본 {dir_scan['raw_rows']}행 -> 병합 {dir_scan['merged_rows']}행 "
+                f"(중복 정리 {dir_scan['duplicates_merged']}건, 유효 실측 {dir_scan['valid_obs_count']}건, 구역: {', '.join(dir_scan['zones'])})"
+            )
+        elif dir_scan["exists"] and not dir_scan["files_found"]:
+            print(f"[안내] 지정된 실측 폴더 '{dir_scan['calib_dir']}'가 비어 있어 기존 입력/폴백 경로를 확인합니다.")
+
+    # 2) 명시 입력이 없고 다중 CSV 폴더에도 데이터가 없으면 기존 자동 탐색 수행
+    has_dir_records = bool(dir_scan["records"])
+    if not any([plan_path, masterplan_csv_path, calib_csv_path]) and not has_dir_records and not (
         Path(db_path).exists() or Path(csv_path).exists()
     ):
         kind, found = auto_discover_input()
@@ -1740,6 +2456,14 @@ def run_pipeline(
         elif kind == "calib_csv" and found:
             calib_csv_path = str(found)
 
+    # plan / masterplan 이 있는 경우 자동 탐색 보조 로드 (폴더 CSV와 병합)
+    if not any([plan_path, masterplan_csv_path]) and has_dir_records:
+        kind, found = auto_discover_input()
+        if kind == "plan" and found:
+            plan_path = str(found)
+        elif kind == "masterplan_csv" and found:
+            masterplan_csv_path = str(found)
+
     if plan_path:
         plan_data = load_html_plan_json(
             Path(plan_path),
@@ -1748,7 +2472,12 @@ def run_pipeline(
     elif masterplan_csv_path:
         plan_data = load_masterplan_csv(Path(masterplan_csv_path))
 
-    # 기상 CSV 단독 또는 Plan + 기상 CSV 병합
+    weather_ds: Optional[Dict[str, Any]] = None
+    if weather_csv_path:
+        stations = load_weather_csv(Path(weather_csv_path))
+        weather_ds = stations.get(station) if (station and station in stations) else next(iter(stations.values()))
+
+    # 3) 파이프라인 분기
     if plan_data is not None:
         config = plan_data["config"]
         week_rows = plan_data["week_rows"]
@@ -1757,12 +2486,22 @@ def run_pipeline(
         resolved_zone = zone_id or plan_data["zone_label"]
         source_kind = plan_data["source"]
 
-        if weather_csv_path:
-            stations = load_weather_csv(Path(weather_csv_path))
-            ds = stations.get(station) if (station and station in stations) else next(iter(stations.values()))
-            week_rows = apply_weather_dataset_to_plan(ds, config, week_rows)
-            resolved_zone = zone_id or ds["name"]
+        if weather_ds is not None:
+            week_rows = apply_weather_dataset_to_plan(weather_ds, config, week_rows)
+            resolved_zone = zone_id or weather_ds["name"]
             source_kind += "+weather_csv"
+
+        if has_dir_records:
+            target_dir_recs = [
+                r for r in dir_scan["records"]
+                if r.get("zone_id") in (resolved_zone, zone_id, "Zone_A", plan_data["zone_label"])
+            ]
+            other_dir_recs = [r for r in dir_scan["records"] if r not in target_dir_recs]
+            calib_rows, unmatched_target = apply_calib_records_to_periods(target_dir_recs, config, calib_rows)
+            extra_raw = other_dir_recs + unmatched_target
+            if extra_raw:
+                extra_train_rows = build_tabular_ml_rows(extra_raw, default_start_date=str(config["start"]), weather_ds=weather_ds)
+            source_kind += f"+calib_dir({len(dir_scan['files_used'])}files)"
 
         if calib_csv_path:
             calib_rows = parse_calib_csv_into_rows(Path(calib_csv_path), config, calib_rows)
@@ -1770,48 +2509,113 @@ def run_pipeline(
 
         sim = simulate_masterplan(config, week_rows, env_months, calib_rows)
         rows_ml = build_ml_rows_from_simulation(sim, calib_rows)
-    elif calib_csv_path:
-        # 실측 입력 양식 CSV만 제공된 경우 기본 작기·표준 환경 + 기상 CSV(선택)로 시뮬레이션 구성
-        config = {**DEFAULT_CONFIG, "start": season_start_date, "harvestEnd": harvest_end_date}
-        periods = plan_periods(config["start"], config["harvestEnd"])
-        env_months = [dict(x) for x in STANDARD_ENV_MONTHS]
-        week_rows = [
-            {
-                "mj": DEFAULT_MONTHLY_MJ[p["at"].month - 1],
-                "lag": int(config["cropLag"]),
-                "eff": float(config["eff"]),
-            }
-            for p in periods
-        ]
-        resolved_zone = zone_id or "HTML_Calib_Template"
-        source_kind = "html_calib_csv"
 
-        if weather_csv_path:
-            stations = load_weather_csv(Path(weather_csv_path))
-            ds = stations.get(station) if (station and station in stations) else next(iter(stations.values()))
-            week_rows = apply_weather_dataset_to_plan(ds, config, week_rows)
-            resolved_zone = zone_id or ds["name"]
-            source_kind += "+weather_csv"
+    elif has_dir_records or calib_csv_path:
+        combined_recs: List[Dict[str, Any]] = list(dir_scan["records"])
+        used_files_cnt = len(dir_scan["files_used"])
+        if calib_csv_path:
+            explicit_recs, _ = parse_flexible_calib_csv(
+                Path(calib_csv_path),
+                source_label=Path(calib_csv_path).name,
+                default_zone=zone_id or "Zone_A",
+            )
+            combined_recs.extend(explicit_recs)
+            combined_recs, _ = merge_and_deduplicate_calib_records(combined_recs)
+            used_files_cnt += 1
 
-        calib_rows = parse_calib_csv_into_rows(Path(calib_csv_path), config, None)
-        sim = simulate_masterplan(config, week_rows, env_months, calib_rows)
-        rows_ml = build_ml_rows_from_simulation(sim, calib_rows)
+        if not combined_recs:
+            raise ValueError(
+                f"'{calib_dir}' 폴더와 지정 CSV에서 유효한 실측 수확량 데이터를 찾지 못했습니다."
+            )
+
+        resolved_zone = _select_target_zone_from_records(combined_recs, zone_id)
+        target_recs = [r for r in combined_recs if str(r.get("zone_id") or "") == resolved_zone]
+        other_recs = [r for r in combined_recs if str(r.get("zone_id") or "") != resolved_zone]
+
+        # 풍부한 환경 피처가 있거나 1~5주차부터 즉시 수확 실측이 시작되는 표 형식 데이터 여부 판별
+        obs_wks = [int(r["week_no"]) for r in target_recs if r.get("y_actual") is not None and r.get("week_no") is not None]
+        is_tabular_style = any(r.get("_has_rich_features") for r in target_recs) or (bool(obs_wks) and min(obs_wks) <= 5)
+
+        if is_tabular_style:
+            rows_ml = build_tabular_ml_rows(target_recs, default_start_date=season_start_date, weather_ds=weather_ds)
+            if other_recs:
+                extra_train_rows = build_tabular_ml_rows(other_recs, default_start_date=season_start_date, weather_ds=weather_ds)
+            source_kind = f"calib_dir_tabular({used_files_cnt}files)" if has_dir_records else "calib_csv_tabular"
+        else:
+            # HTML [CSV 양식 받기] 형식: 날짜가 기본 작기와 다르면 관측 기간에 맞춰 시뮬레이션 작기 자동 정렬
+            dated = sorted(r["date"] for r in target_recs if r.get("date"))
+            sim_start = season_start_date
+            sim_end = harvest_end_date
+            if dated and season_start_date == "2027-01-01" and harvest_end_date == "2027-12-31":
+                min_dt = parse_date(dated[0])
+                max_dt = parse_date(dated[-1])
+                if min_dt < parse_date("2027-01-01") or max_dt > parse_date("2027-12-31"):
+                    sim_start = min_dt.isoformat()
+                    span_end = max(max_dt, min_dt + timedelta(days=364))
+                    if (span_end - min_dt).days > 730:
+                        span_end = min_dt + timedelta(days=730)
+                    sim_end = span_end.isoformat()
+
+            config = {**DEFAULT_CONFIG, "start": sim_start, "harvestEnd": sim_end}
+            periods = plan_periods(config["start"], config["harvestEnd"])
+            env_months = [dict(x) for x in STANDARD_ENV_MONTHS]
+            week_rows = [
+                {
+                    "mj": DEFAULT_MONTHLY_MJ[p["at"].month - 1],
+                    "lag": int(config["cropLag"]),
+                    "eff": float(config["eff"]),
+                }
+                for p in periods
+            ]
+            if weather_ds is not None:
+                week_rows = apply_weather_dataset_to_plan(weather_ds, config, week_rows)
+                if not zone_id and resolved_zone == "Zone_A":
+                    resolved_zone = weather_ds["name"]
+
+            calib_rows, unmatched_target = apply_calib_records_to_periods(target_recs, config, None)
+            extra_raw = other_recs + unmatched_target
+            if extra_raw:
+                extra_train_rows = build_tabular_ml_rows(extra_raw, default_start_date=sim_start, weather_ds=weather_ds)
+
+            sim = simulate_masterplan(config, week_rows, env_months, calib_rows)
+            rows_ml = build_ml_rows_from_simulation(sim, calib_rows)
+            source_kind = f"calib_dir_sim({used_files_cnt}files)" if has_dir_records else "html_calib_csv"
+            if weather_ds is not None:
+                source_kind += "+weather_csv"
+
+        if calib_csv_path and has_dir_records:
+            source_kind += "+calib_csv"
+
     else:
         resolved_zone = zone_id or "Zone_A"
-        rows_ml, source_kind = load_legacy_tabular_records(
-            db_path=db_path,
-            csv_path=csv_path,
-            zone_id=resolved_zone,
-            season_start_date=season_start_date,
-        )
+        try:
+            rows_ml, source_kind = load_legacy_tabular_records(
+                db_path=db_path,
+                csv_path=csv_path,
+                zone_id=resolved_zone,
+                season_start_date=season_start_date,
+            )
+        except FileNotFoundError as exc:
+            calib_dir_note = f"'{calib_dir}' 폴더 내 *.csv 파일, " if not no_calib_dir and calib_dir else ""
+            raise FileNotFoundError(
+                f"학습할 실측 데이터를 찾을 수 없습니다. {calib_dir_note}"
+                f"HTML 내보내기 파일(--plan, --masterplan-csv, --calib-csv) 또는 '{db_path}' / '{csv_path}'를 확인해 주세요."
+            ) from exc
 
-    predictions, metrics = fit_and_predict_ml(rows_ml, base_week=base_week, min_weeks=min_weeks)
+    predictions, metrics = fit_and_predict_ml(
+        rows_ml,
+        base_week=base_week,
+        min_weeks=min_weeks,
+        extra_train_rows=extra_train_rows,
+    )
 
     payload = {
         "zone": resolved_zone,
         "model": metrics["model_name"],
         "base_week": metrics["base_week"],
         "matched_obs_weeks": metrics["matched_obs_weeks"],
+        "train_samples": metrics["train_samples"],
+        "calib_files_used": dir_scan["files_used"],
         "mae": metrics["mae"],
         "rmse": metrics["rmse"],
         "bias": metrics["bias"],
@@ -1851,6 +2655,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan", help="HTML [계획 저장(JSON)] / [캘리브레이션 프리셋 저장] / localStorage JSON 파일 경로")
     parser.add_argument("--masterplan-csv", help="HTML [마스터플랜 CSV 다운로드] (토마토_마스터플랜_v3_*.csv) 경로")
     parser.add_argument("--calib-csv", help="HTML [CSV 양식 받기] 실측 데이터 CSV 경로")
+    parser.add_argument(
+        "--calib-dir",
+        default=DEFAULT_CALIB_DIR,
+        help=f"다중 실측 CSV 파일 자동 수집·병합 폴더 경로 (기본: {DEFAULT_CALIB_DIR})",
+    )
+    parser.add_argument(
+        "--no-calib-dir",
+        action="store_true",
+        help="실측 CSV 폴더(--calib-dir) 자동 스캔 비활성화",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="--calib-dir 하위 디렉터리의 *.csv 파일까지 재귀 스캔",
+    )
     parser.add_argument("--weather-csv", help="기상청 ASOS 일자료 또는 Open-Meteo 기상 관측 CSV 경로")
     parser.add_argument("--weather-db", help="localStorage(LMH_TOMATO_PLANNER_V3_WEATHER_DB) JSON 파일 경로")
     parser.add_argument("--station", help="다중 지점 ASOS CSV에서 사용할 지점명 (예: 논산, 대전, 수원)")
@@ -1858,7 +2677,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--csv", default="raw_yield_source.csv", help="레거시 원천 CSV 경로")
     parser.add_argument("--zone", default=None, help="출력 JSON에 기록할 구역/품종 라벨")
     parser.add_argument("--base-week", type=int, default=None, help="학습 기준 마지막 주차 (미지정 시 실측 마지막 주차 자동 사용)")
-    parser.add_argument("--min-weeks", type=int, default=4, help="학습에 필요한 최소 실측 주차 수 (기본: 4)")
+    parser.add_argument("--min-weeks", type=int, default=4, help="학습에 필요한 최소 실측 샘플 수 (기본: 4)")
     parser.add_argument("--start", default="2027-01-01", help="작기 시작일 YYYY-MM-DD (단독 CSV 실행 시)")
     parser.add_argument("--harvest-end", default="2027-12-31", help="수확 종료일 YYYY-MM-DD (단독 CSV 실행 시)")
     parser.add_argument(
@@ -1878,6 +2697,9 @@ def main() -> None:
         plan_path=args.plan,
         masterplan_csv_path=args.masterplan_csv,
         calib_csv_path=args.calib_csv,
+        calib_dir=args.calib_dir,
+        no_calib_dir=args.no_calib_dir,
+        calib_dir_recursive=args.recursive,
         weather_csv_path=args.weather_csv,
         weather_db_path=args.weather_db,
         station=args.station,
@@ -1894,8 +2716,11 @@ def main() -> None:
     out_saved = args.output or resolve_default_output_path()
     mae_str = f"{result['mae']:.4f}" if result["mae"] is not None else "-"
     rmse_str = f"{result['rmse']:.4f}" if result["rmse"] is not None else "-"
+    files_cnt = len(result.get("calib_files_used") or [])
+    train_samples = result.get("train_samples", result["matched_obs_weeks"])
     print(
         f"[완료] {out_saved} 저장됨 | 구역: {result['zone']} | 모델: {result['model']} | "
+        f"폴더 CSV: {files_cnt}개 | 학습 샘플: {train_samples}건 | "
         f"총 {len(result['predictions'])}주 예측 (실측 매칭 {result['matched_obs_weeks']}주, "
         f"MAE={mae_str} kg/㎡, RMSE={rmse_str} kg/㎡)"
     )
