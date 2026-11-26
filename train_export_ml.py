@@ -3,16 +3,17 @@
 """
 LMH-Tomato-Planner v4.0 연동용 머신러닝 학습 및 예측 JSON(ml_pred.json) 내보내기 스크립트
 
-지원 입력(HTML → Python):
-  1) HTML [계획 저장(JSON)] / [캘리브레이션 프리셋 저장] / localStorage(LMH_TOMATO_PLANNER_V3_CALIB_STATE) JSON
-  2) HTML [마스터플랜 CSV 다운로드] (토마토_마스터플랜_v3_*.csv)
-  3) HTML [CSV 양식 받기] 실측 입력 CSV (토마토_실측데이터_입력양식.csv)
-  4) 기상 관측 CSV (기상청 ASOS 일자료 EUC-KR/UTF-8 다중 지점 자동 분리 · Open-Meteo kWh→MJ 자동 변환)
-  5) 기존 SQLite DB (smartfarm_yield_swing.db / weekly_yield_data) 및 원천 CSV (raw_yield_source.csv)
+지원 입력(HTML / Streamlit → Python):
+  1) 다중 실측 파일 폴더(--calib-dir, 기본: data/calib_csv): .csv, .xlsx, .xls 자동 스캔·병합
+  2) HTML [계획 저장(JSON)] / [캘리브레이션 프리셋 저장] / localStorage(LMH_TOMATO_PLANNER_V3_CALIB_STATE) JSON
+  3) HTML [마스터플랜 CSV 다운로드] (토마토_마스터플랜_v3_*.csv)
+  4) HTML [CSV 양식 받기] 실측 입력 CSV/Excel (토마토_실측데이터_입력양식.csv / .xlsx / .xls)
+  5) 기상 관측 CSV (기상청 ASOS 일자료 EUC-KR/UTF-8 다중 지점 자동 분리 · Open-Meteo kWh→MJ 자동 변환)
+  6) 기존 SQLite DB (smartfarm_yield_swing.db / weekly_yield_data) 및 원천 CSV (raw_yield_source.csv)
 
-지원 출력(Python → public/simulator.html):
+지원 출력(Python → public/simulator.html / Streamlit app.py):
   - Vite 정적 서빙 구조(public/ 디렉터리 존재 시)에서는 기본 'public/ml_pred.json'으로 저장되어
-    public/simulator.html의 [ML JSON 불러오기](fetch("./ml_pred.json"))가 즉시 동작함
+    public/simulator.html의 [ML JSON 불러오기](fetch("./ml_pred.json")) 및 Streamlit 임베디드 뷰와 즉시 연동됨
   - 단독 실행 환경(public/ 미존재 시)에서는 현재 경로 'ml_pred.json'으로 저장되며 --output으로 변경 가능
   - [JSON 파일 선택] 버튼으로도 수동 업로드 가능
     (week, week_no, start, date, y_pred, pred, yield, y_actual, orig_kg, adj_kg, k_total, dyn_lag, MAE/RMSE)
@@ -29,6 +30,8 @@ import os
 import random
 import re
 import sqlite3
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -48,6 +51,16 @@ try:
 except ImportError:
     SklearnRandomForestRegressor = None  # type: ignore
 
+try:
+    import openpyxl  # type: ignore
+except ImportError:
+    openpyxl = None  # type: ignore
+
+try:
+    import xlrd  # type: ignore
+except ImportError:
+    xlrd = None  # type: ignore
+
 
 # ==============================================================================
 # 1. HTML(LMH-Tomato-Planner-v4.0)과 100% 동기화된 상수 · 기본 환경 프리셋
@@ -57,6 +70,7 @@ PYEONG_TO_M2 = 3.305785
 DEFAULT_BASE_EFF = 8.0
 PAR_FACTOR_DEFAULT = 2.08
 DEFAULT_CALIB_DIR = "data/calib_csv"
+SUPPORTED_CALIB_EXTS = (".csv", ".xlsx", ".xls")
 
 FEATURES = [
     "ma_3week",
@@ -191,6 +205,10 @@ def parse_date(s: str) -> date:
 def normalize_weather_date(s: Any) -> Optional[str]:
     if s is None:
         return None
+    if isinstance(s, datetime):
+        return s.date().isoformat()
+    if isinstance(s, date):
+        return s.isoformat()
     try:
         return parse_date(str(s)).isoformat()
     except ValueError:
@@ -1444,84 +1462,272 @@ def _sanitize_calib_numeric(field: str, val: Optional[float]) -> Optional[float]
     return float(val)
 
 
-def parse_flexible_calib_csv(
-    csv_path: Path,
-    source_label: Optional[str] = None,
+def _excel_cell_to_str(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, datetime):
+        return val.date().isoformat()
+    if isinstance(val, date):
+        return val.isoformat()
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            return ""
+        if val.is_integer():
+            return str(int(val))
+        return str(val)
+    s = str(val).strip()
+    if s.lower() in ("nan", "nat", "none", "null"):
+        return ""
+    return s
+
+
+def _trim_grid_rows(raw_grid: List[List[Any]]) -> List[List[str]]:
+    cleaned: List[List[str]] = []
+    for row in raw_grid:
+        cells = [_excel_cell_to_str(c) for c in row]
+        while cells and cells[-1] == "":
+            cells.pop()
+        if any(c != "" for c in cells):
+            cleaned.append(cells)
+    return cleaned
+
+
+def _read_xlsx_with_openpyxl(excel_path: Path) -> List[Tuple[str, List[List[str]]]]:
+    if openpyxl is None:
+        raise ImportError("openpyxl 패키지가 설치되어 있지 않습니다.")
+    wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
+    sheets: List[Tuple[str, List[List[str]]]] = []
+    try:
+        for name in wb.sheetnames:
+            ws = wb[name]
+            raw_rows = [list(r) for r in ws.iter_rows(values_only=True)]
+            grid = _trim_grid_rows(raw_rows)
+            if grid:
+                sheets.append((name, grid))
+    finally:
+        wb.close()
+    return sheets
+
+
+def _col_letters_to_idx(ref: str) -> int:
+    m = re.match(r"^([A-Za-z]+)", ref)
+    if not m:
+        return 0
+    idx = 0
+    for ch in m.group(1).upper():
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return max(0, idx - 1)
+
+
+def _read_xlsx_stdlib_fallback(excel_path: Path) -> List[Tuple[str, List[List[str]]]]:
+    """openpyxl 미설치 환경에서도 .xlsx(OOXML)를 읽기 위한 경량 표준 라이브러리 폴백"""
+    ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    ns_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    sheets_out: List[Tuple[str, List[List[str]]]] = []
+
+    with zipfile.ZipFile(excel_path, "r") as zf:
+        shared_strings: List[str] = []
+        if "xl/sharedStrings.xml" in zf.namelist():
+            ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in ss_root.findall(f"{{{ns_main}}}si"):
+                txt = "".join(t.text or "" for t in si.iter(f"{{{ns_main}}}t"))
+                shared_strings.append(txt)
+
+        wb_root = ET.fromstring(zf.read("xl/workbook.xml"))
+        rels_map: Dict[str, str] = {}
+        if "xl/_rels/workbook.xml.rels" in zf.namelist():
+            rels_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+            for rel in rels_root:
+                rid = rel.attrib.get("Id", "")
+                target = rel.attrib.get("Target", "").lstrip("/")
+                if target and not target.startswith("xl/"):
+                    target = f"xl/{target}"
+                rels_map[rid] = target
+
+        sheet_entries: List[Tuple[str, str]] = []
+        for idx, sh in enumerate(wb_root.findall(f".//{{{ns_main}}}sheet"), start=1):
+            name = sh.attrib.get("name", f"Sheet{idx}")
+            rid = sh.attrib.get(f"{{{ns_rel}}}id", "")
+            target = rels_map.get(rid, f"xl/worksheets/sheet{idx}.xml")
+            if target in zf.namelist():
+                sheet_entries.append((name, target))
+
+        for name, target in sheet_entries:
+            ws_root = ET.fromstring(zf.read(target))
+            rows_parsed: List[List[str]] = []
+            for row_el in ws_root.findall(f".//{{{ns_main}}}sheetData/{{{ns_main}}}row"):
+                row_vals: Dict[int, str] = {}
+                max_col = -1
+                seq_col = 0
+                for c_el in row_el.findall(f"{{{ns_main}}}c"):
+                    ref = c_el.attrib.get("r", "")
+                    col_idx = _col_letters_to_idx(ref) if ref else seq_col
+                    seq_col = col_idx + 1
+                    c_type = c_el.attrib.get("t", "")
+                    val_str = ""
+                    if c_type == "inlineStr":
+                        val_str = "".join(t.text or "" for t in c_el.iter(f"{{{ns_main}}}t"))
+                    else:
+                        v_el = c_el.find(f"{{{ns_main}}}v")
+                        if v_el is not None and v_el.text is not None:
+                            if c_type == "s":
+                                s_idx = int(v_el.text)
+                                val_str = shared_strings[s_idx] if 0 <= s_idx < len(shared_strings) else ""
+                            else:
+                                val_str = v_el.text
+                    row_vals[col_idx] = val_str.strip()
+                    if col_idx > max_col:
+                        max_col = col_idx
+                if max_col >= 0:
+                    rows_parsed.append([row_vals.get(i, "") for i in range(max_col + 1)])
+            grid = _trim_grid_rows(rows_parsed)
+            if grid:
+                sheets_out.append((name, grid))
+    return sheets_out
+
+
+def _read_xls_with_xlrd(excel_path: Path) -> List[Tuple[str, List[List[str]]]]:
+    if xlrd is None:
+        raise ImportError("'.xls' 구형 엑셀 파일을 읽으려면 xlrd>=2.0.1 패키지가 필요합니다.")
+    wb = xlrd.open_workbook(str(excel_path))
+    sheets: List[Tuple[str, List[List[str]]]] = []
+    for sheet in wb.sheets():
+        raw_rows: List[List[Any]] = []
+        for r_idx in range(sheet.nrows):
+            row_vals: List[Any] = []
+            for c_idx in range(sheet.ncols):
+                cell = sheet.cell(r_idx, c_idx)
+                val = cell.value
+                if cell.ctype == xlrd.XL_CELL_DATE:
+                    try:
+                        val = xlrd.xldate_as_datetime(val, wb.datemode).date().isoformat()
+                    except Exception:
+                        pass
+                row_vals.append(val)
+            raw_rows.append(row_vals)
+        grid = _trim_grid_rows(raw_rows)
+        if grid:
+            sheets.append((sheet.name, grid))
+    return sheets
+
+
+def _read_excel_sheets(excel_path: Path) -> List[Tuple[str, List[List[str]]]]:
+    ext = excel_path.suffix.lower()
+    if ext == ".xls":
+        return _read_xls_with_xlrd(excel_path)
+    if openpyxl is not None:
+        return _read_xlsx_with_openpyxl(excel_path)
+    if pd is not None:
+        xls = pd.ExcelFile(excel_path)
+        out: List[Tuple[str, List[List[str]]]] = []
+        for name in xls.sheet_names:
+            df = xls.parse(name, header=None, dtype=object)
+            grid = _trim_grid_rows(df.values.tolist())
+            if grid:
+                out.append((str(name), grid))
+        return out
+    return _read_xlsx_stdlib_fallback(excel_path)
+
+
+def _parse_masterplan_grid(
+    grid: List[List[str]],
+    src_name: str,
+    default_zone: str = "Zone_A",
+) -> List[Dict[str, Any]]:
+    weekly_header_idx = -1
+    zone_label = default_zone
+    start_str = DEFAULT_CONFIG["start"]
+
+    for idx, cells in enumerate(grid):
+        if not cells:
+            continue
+        if cells[0] == "지역" and len(cells) >= 4:
+            city_name = cells[1] or "Unknown"
+            scen_name = cells[3] if len(cells) > 3 else ""
+            zone_label = f"{city_name} ({scen_name})" if scen_name else city_name
+            crop_span = cells[5] if len(cells) > 5 else ""
+            m_span = re.match(r"(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})", crop_span)
+            if m_span:
+                start_str = m_span.group(1)
+        elif cells[0].startswith("[주별 세부 광량"):
+            weekly_header_idx = idx + 1
+            break
+
+    if weekly_header_idx < 0:
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for cells in grid[weekly_header_idx + 1 :]:
+        if len(cells) < 16:
+            continue
+        wk_no = to_float(cells[0])
+        if wk_no is None:
+            continue
+        y_act = _sanitize_calib_numeric("y_actual", to_float(cells[15]))
+        if y_act is None:
+            continue
+        s_date = normalize_weather_date(cells[1])
+        if not s_date:
+            s_date = (parse_date(str(start_str)) + timedelta(days=(int(wk_no) - 1) * 7)).isoformat()
+        records.append({
+            "zone_id": zone_label or default_zone,
+            "week_no": int(round(wk_no)),
+            "date": s_date,
+            "y_actual": y_act,
+            "mj_out": _sanitize_calib_numeric("mj_out", to_float(cells[4])),
+            "t_mean": _sanitize_calib_numeric("t_mean", to_float(cells[5])),
+            "dyn_lag": _sanitize_calib_numeric("dyn_lag", to_float(cells[6])),
+            "eff_w": _sanitize_calib_numeric("eff_w", to_float(cells[7])),
+            "_source_file": src_name,
+            "_has_rich_features": False,
+        })
+    return records
+
+
+def _parse_flexible_calib_grid(
+    grid: List[List[str]],
+    src_name: str,
     default_zone: str = "Zone_A",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    다중 실측 CSV 폴더 내 개별 CSV 파일을 유연하게 파싱한다.
-    지원 형식:
-      1) 헤더가 있는 실측/환경 CSV (영문/한글 별칭 컬럼 자동 매핑)
-      2) HTML [CSV 양식 받기] 6컬럼 및 붙여넣기 2~5컬럼(헤더 유무 모두 지원)
-      3) HTML [마스터플랜 CSV 다운로드] 파일
-    기상청 ASOS / Open-Meteo 전용 파일처럼 수확 실측·주차 컬럼이 없는 파일은 안전하게 건너뛴다.
-    """
-    src_name = source_label or csv_path.name
-    text = decode_text_auto(csv_path)
-    raw_lines = [ln for ln in text.splitlines() if ln.strip()]
     stats = {"source_file": src_name, "raw_rows": 0, "skipped_invalid": 0, "kind": "unknown"}
-    if not raw_lines:
+    if not grid:
         return [], stats
 
-    # 마스터플랜 CSV 형식 감지
-    head_preview = "\n".join(raw_lines[:35])
+    head_preview = "\n".join(",".join(r) for r in grid[:35])
     if "[주별 세부 광량" in head_preview and "온실환경연구실 토마토" in head_preview:
-        try:
-            mp = load_masterplan_csv(csv_path)
-            stats["kind"] = "masterplan_csv"
-            periods = plan_periods(str(mp["config"]["start"]), str(mp["config"]["harvestEnd"]))
-            records: List[Dict[str, Any]] = []
-            for idx, (wr, cb) in enumerate(zip(mp["week_rows"], mp["calib_rows"])):
-                y_act = _sanitize_calib_numeric("y_actual", cb.get("obsKg"))
-                if y_act is None:
-                    continue
-                wk_date = periods[idx]["at"].isoformat() if idx < len(periods) else None
-                records.append({
-                    "zone_id": mp["zone_label"] or default_zone,
-                    "week_no": idx + 1,
-                    "date": wk_date,
-                    "y_actual": y_act,
-                    "mj_out": _sanitize_calib_numeric("mj_out", wr.get("mj")),
-                    "eff_w": _sanitize_calib_numeric("eff_w", wr.get("eff")),
-                    "dyn_lag": _sanitize_calib_numeric("dyn_lag", wr.get("lag")),
-                    "t_mean": _sanitize_calib_numeric("t_mean", cb.get("obsT24")),
-                    "_source_file": src_name,
-                    "_has_rich_features": False,
-                })
-            stats["raw_rows"] = len(records)
-            return records, stats
-        except Exception:
-            pass
+        mp_records = _parse_masterplan_grid(grid, src_name=src_name, default_zone=default_zone)
+        if mp_records:
+            stats["kind"] = "masterplan_table"
+            stats["raw_rows"] = len(mp_records)
+            return mp_records, stats
 
-    # Open-Meteo / ASOS 기상 관측 CSV는 실측 수확량 폴더에서 오인 파싱되지 않도록 스킵
-    first_cols_joined = ",".join(_split_csv_row(raw_lines[0])).lower()
+    # Open-Meteo / ASOS 기상 관측 파일은 실측 수확량 폴더에서 오인 파싱되지 않도록 스킵
+    first_cells = grid[0]
+    first_cols_joined = ",".join(first_cells).lower()
+    first_line_text = " ".join(first_cells)
     if ("latitude" in first_cols_joined and "longitude" in first_cols_joined) or (
-        ("지점명" in raw_lines[0] or "shortwave_radiation_sum" in first_cols_joined)
+        ("지점명" in first_line_text or "shortwave_radiation_sum" in first_cols_joined)
         and "수확" not in head_preview
         and "y_actual" not in head_preview.lower()
         and "obs_kg" not in head_preview.lower()
     ):
-        stats["kind"] = "weather_csv_skipped"
+        stats["kind"] = "weather_file_skipped"
         return [], stats
 
-    first_cells = _split_csv_row(raw_lines[0])
     mapped_headers: List[Optional[str]] = [_resolve_calib_column_name(c) for c in first_cells]
     has_header = any(m is not None for m in mapped_headers)
 
-    # 헤더가 없고 첫 줄이 숫자(주차) 또는 날짜로 시작하면 2~5컬럼/6컬럼 무헤더 포맷으로 처리
     records_out: List[Dict[str, Any]] = []
     start_row_idx = 1 if has_header else 0
     if not has_header:
         p0 = first_cells[0] if first_cells else ""
         if to_float(re.sub(r"[^0-9.-]", "", p0)) is None and normalize_weather_date(p0) is None:
-            start_row_idx = 1  # 알 수 없는 텍스트 헤더 행 스킵
+            start_row_idx = 1
 
     mapped_rich = set(m for m in mapped_headers if m in RICH_FEATURE_KEYS)
     stats["kind"] = "header_mapped" if has_header else "positional"
 
-    for row_line in raw_lines[start_row_idx:]:
-        cells = _split_csv_row(row_line)
+    for cells in grid[start_row_idx:]:
         if not cells or all(c == "" for c in cells):
             continue
         stats["raw_rows"] += 1
@@ -1579,7 +1785,6 @@ def parse_flexible_calib_csv(
                     if val is not None:
                         rec[fname] = val
 
-        # 유효 시점 및 최소 관측치 검증
         if rec["week_no"] is None and rec["date"] is None:
             stats["skipped_invalid"] += 1
             continue
@@ -1598,11 +1803,74 @@ def parse_flexible_calib_csv(
     return records_out, stats
 
 
+def parse_flexible_calib_csv(
+    csv_path: Path,
+    source_label: Optional[str] = None,
+    default_zone: str = "Zone_A",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    다중 실측 CSV 폴더 내 개별 CSV 파일을 유연하게 파싱한다.
+    지원 형식:
+      1) 헤더가 있는 실측/환경 CSV (영문/한글 별칭 컬럼 자동 매핑)
+      2) HTML [CSV 양식 받기] 6컬럼 및 붙여넣기 2~5컬럼(헤더 유무 모두 지원)
+      3) HTML [마스터플랜 CSV 다운로드] 파일
+    기상청 ASOS / Open-Meteo 전용 파일처럼 수확 실측·주차 컬럼이 없는 파일은 안전하게 건너뛴다.
+    """
+    src_name = source_label or csv_path.name
+    text = decode_text_auto(csv_path)
+    raw_lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not raw_lines:
+        return [], {"source_file": src_name, "raw_rows": 0, "skipped_invalid": 0, "kind": "empty"}
+
+    grid = [_split_csv_row(ln) for ln in raw_lines]
+    return _parse_flexible_calib_grid(grid, src_name=src_name, default_zone=default_zone)
+
+
+def parse_flexible_calib_excel(
+    excel_path: Path,
+    source_label: Optional[str] = None,
+    default_zone: str = "Zone_A",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    다중 시트 엑셀(.xlsx, .xls) 파일을 읽어 첫 번째 시트부터 순서대로 검사해
+    유효 데이터가 포함된 시트를 안전하게 파싱한다.
+    """
+    src_name = source_label or excel_path.name
+    sheets = _read_excel_sheets(excel_path)
+    if not sheets:
+        return [], {"source_file": src_name, "raw_rows": 0, "skipped_invalid": 0, "kind": "excel_empty"}
+
+    last_stats = {"source_file": src_name, "raw_rows": 0, "skipped_invalid": 0, "kind": "excel_no_valid_sheet"}
+    for sheet_idx, (sheet_name, grid) in enumerate(sheets):
+        sheet_label = src_name if sheet_idx == 0 else f"{src_name}#{sheet_name}"
+        recs, st = _parse_flexible_calib_grid(grid, src_name=sheet_label, default_zone=default_zone)
+        last_stats = st
+        if recs:
+            st["sheet_name"] = sheet_name
+            st["kind"] = f"excel_{st['kind']}"
+            return recs, st
+        if st.get("kind") == "weather_file_skipped" and len(sheets) == 1:
+            return [], st
+
+    return [], last_stats
+
+
+def parse_flexible_calib_file(
+    file_path: Path,
+    source_label: Optional[str] = None,
+    default_zone: str = "Zone_A",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    ext = file_path.suffix.lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        return parse_flexible_calib_excel(file_path, source_label=source_label, default_zone=default_zone)
+    return parse_flexible_calib_csv(file_path, source_label=source_label, default_zone=default_zone)
+
+
 def merge_and_deduplicate_calib_records(
     records: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
-    다중 CSV에서 수집된 레코드를 (zone_id, date 또는 week_no) 키로 중복 정리한다.
+    다중 CSV/Excel에서 수집된 레코드를 (zone_id, date 또는 week_no) 키로 중복 정리한다.
     정렬 순서(파일명 순 -> 행 순) 기준 뒤쪽(최신) 파일 값으로 병합/갱신한다.
     """
     merged_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -1665,13 +1933,15 @@ def load_calib_dir_records(
     recursive: bool = False,
     default_zone: str = "Zone_A",
 ) -> Dict[str, Any]:
-    """지정 폴더(기본: data/calib_csv/)의 모든 CSV를 정렬 순서로 스캔·병합한다."""
+    """지정 폴더(기본: data/calib_csv/)의 모든 CSV 및 엑셀(.xlsx/.xls)을 정렬 순서로 스캔·병합한다."""
     if not calib_dir.exists() or not calib_dir.is_dir():
         return {
             "exists": False,
             "calib_dir": str(calib_dir),
             "files_found": [],
             "files_used": [],
+            "csv_count": 0,
+            "excel_count": 0,
             "records": [],
             "raw_rows": 0,
             "merged_rows": 0,
@@ -1681,22 +1951,33 @@ def load_calib_dir_records(
         }
 
     pattern_iter = calib_dir.rglob("*") if recursive else calib_dir.iterdir()
-    csv_files = sorted(
-        [p for p in pattern_iter if p.is_file() and p.suffix.lower() == ".csv"],
+    data_files = sorted(
+        [
+            p for p in pattern_iter
+            if p.is_file()
+            and not p.name.startswith("~$")
+            and p.suffix.lower() in SUPPORTED_CALIB_EXTS
+        ],
         key=lambda p: p.relative_to(calib_dir).as_posix().lower(),
     )
 
     all_raw_records: List[Dict[str, Any]] = []
     files_used: List[str] = []
+    csv_count = 0
+    excel_count = 0
     raw_rows_total = 0
 
-    for p in csv_files:
+    for p in data_files:
         rel_name = p.relative_to(calib_dir).as_posix()
         try:
-            recs, st = parse_flexible_calib_csv(p, source_label=rel_name, default_zone=default_zone)
+            recs, st = parse_flexible_calib_file(p, source_label=rel_name, default_zone=default_zone)
             raw_rows_total += st["raw_rows"]
             if recs:
                 files_used.append(rel_name)
+                if p.suffix.lower() == ".csv":
+                    csv_count += 1
+                else:
+                    excel_count += 1
                 all_raw_records.extend(recs)
         except Exception as exc:
             print(f"[경고] '{rel_name}' 파싱 중 오류가 발생하여 건너뜁니다: {exc}")
@@ -1708,8 +1989,10 @@ def load_calib_dir_records(
     return {
         "exists": True,
         "calib_dir": str(calib_dir),
-        "files_found": [p.relative_to(calib_dir).as_posix() for p in csv_files],
+        "files_found": [p.relative_to(calib_dir).as_posix() for p in data_files],
         "files_used": files_used,
+        "csv_count": csv_count,
+        "excel_count": excel_count,
         "records": merged_records,
         "raw_rows": raw_rows_total,
         "merged_rows": len(merged_records),
@@ -2415,12 +2698,14 @@ def run_pipeline(
     plan_data: Optional[Dict[str, Any]] = None
     extra_train_rows: List[Dict[str, Any]] = []
 
-    # 1) 다중 실측 CSV 폴더 스캔 (--no-calib-dir 미지정 시)
+    # 1) 다중 실측 CSV/Excel 폴더 스캔 (--no-calib-dir 미지정 시)
     dir_scan: Dict[str, Any] = {
         "exists": False,
         "calib_dir": calib_dir or "",
         "files_found": [],
         "files_used": [],
+        "csv_count": 0,
+        "excel_count": 0,
         "records": [],
         "raw_rows": 0,
         "merged_rows": 0,
@@ -2436,14 +2721,15 @@ def run_pipeline(
         )
         if dir_scan["files_used"]:
             print(
-                f"[실측 폴더 스캔] '{dir_scan['calib_dir']}' | 사용 CSV {len(dir_scan['files_used'])}개 "
-                f"({', '.join(dir_scan['files_used'])}) | 원본 {dir_scan['raw_rows']}행 -> 병합 {dir_scan['merged_rows']}행 "
+                f"[실측 폴더 스캔] '{dir_scan['calib_dir']}' | 사용 파일 {len(dir_scan['files_used'])}개 "
+                f"(CSV {dir_scan['csv_count']}개, Excel {dir_scan['excel_count']}개: {', '.join(dir_scan['files_used'])}) | "
+                f"원본 {dir_scan['raw_rows']}행 -> 병합 {dir_scan['merged_rows']}행 "
                 f"(중복 정리 {dir_scan['duplicates_merged']}건, 유효 실측 {dir_scan['valid_obs_count']}건, 구역: {', '.join(dir_scan['zones'])})"
             )
         elif dir_scan["exists"] and not dir_scan["files_found"]:
             print(f"[안내] 지정된 실측 폴더 '{dir_scan['calib_dir']}'가 비어 있어 기존 입력/폴백 경로를 확인합니다.")
 
-    # 2) 명시 입력이 없고 다중 CSV 폴더에도 데이터가 없으면 기존 자동 탐색 수행
+    # 2) 명시 입력이 없고 다중 폴더에도 데이터가 없으면 기존 자동 탐색 수행
     has_dir_records = bool(dir_scan["records"])
     if not any([plan_path, masterplan_csv_path, calib_csv_path]) and not has_dir_records and not (
         Path(db_path).exists() or Path(csv_path).exists()
@@ -2456,7 +2742,7 @@ def run_pipeline(
         elif kind == "calib_csv" and found:
             calib_csv_path = str(found)
 
-    # plan / masterplan 이 있는 경우 자동 탐색 보조 로드 (폴더 CSV와 병합)
+    # plan / masterplan 이 있는 경우 자동 탐색 보조 로드 (폴더 파일과 병합)
     if not any([plan_path, masterplan_csv_path]) and has_dir_records:
         kind, found = auto_discover_input()
         if kind == "plan" and found:
@@ -2504,8 +2790,17 @@ def run_pipeline(
             source_kind += f"+calib_dir({len(dir_scan['files_used'])}files)"
 
         if calib_csv_path:
-            calib_rows = parse_calib_csv_into_rows(Path(calib_csv_path), config, calib_rows)
-            source_kind += "+calib_csv"
+            c_path = Path(calib_csv_path)
+            if c_path.suffix.lower() in (".xlsx", ".xlsm", ".xls"):
+                c_recs, _ = parse_flexible_calib_file(c_path, source_label=c_path.name, default_zone=resolved_zone)
+                calib_rows, c_unmatched = apply_calib_records_to_periods(c_recs, config, calib_rows)
+                if c_unmatched:
+                    extra_train_rows.extend(
+                        build_tabular_ml_rows(c_unmatched, default_start_date=str(config["start"]), weather_ds=weather_ds)
+                    )
+            else:
+                calib_rows = parse_calib_csv_into_rows(c_path, config, calib_rows)
+            source_kind += "+calib_file"
 
         sim = simulate_masterplan(config, week_rows, env_months, calib_rows)
         rows_ml = build_ml_rows_from_simulation(sim, calib_rows)
@@ -2514,7 +2809,7 @@ def run_pipeline(
         combined_recs: List[Dict[str, Any]] = list(dir_scan["records"])
         used_files_cnt = len(dir_scan["files_used"])
         if calib_csv_path:
-            explicit_recs, _ = parse_flexible_calib_csv(
+            explicit_recs, _ = parse_flexible_calib_file(
                 Path(calib_csv_path),
                 source_label=Path(calib_csv_path).name,
                 default_zone=zone_id or "Zone_A",
@@ -2525,7 +2820,7 @@ def run_pipeline(
 
         if not combined_recs:
             raise ValueError(
-                f"'{calib_dir}' 폴더와 지정 CSV에서 유효한 실측 수확량 데이터를 찾지 못했습니다."
+                f"'{calib_dir}' 폴더와 지정 파일에서 유효한 실측 수확량 데이터를 찾지 못했습니다."
             )
 
         resolved_zone = _select_target_zone_from_records(combined_recs, zone_id)
@@ -2596,7 +2891,7 @@ def run_pipeline(
                 season_start_date=season_start_date,
             )
         except FileNotFoundError as exc:
-            calib_dir_note = f"'{calib_dir}' 폴더 내 *.csv 파일, " if not no_calib_dir and calib_dir else ""
+            calib_dir_note = f"'{calib_dir}' 폴더 내 *.csv/*.xlsx/*.xls 파일, " if not no_calib_dir and calib_dir else ""
             raise FileNotFoundError(
                 f"학습할 실측 데이터를 찾을 수 없습니다. {calib_dir_note}"
                 f"HTML 내보내기 파일(--plan, --masterplan-csv, --calib-csv) 또는 '{db_path}' / '{csv_path}'를 확인해 주세요."
@@ -2654,21 +2949,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--plan", help="HTML [계획 저장(JSON)] / [캘리브레이션 프리셋 저장] / localStorage JSON 파일 경로")
     parser.add_argument("--masterplan-csv", help="HTML [마스터플랜 CSV 다운로드] (토마토_마스터플랜_v3_*.csv) 경로")
-    parser.add_argument("--calib-csv", help="HTML [CSV 양식 받기] 실측 데이터 CSV 경로")
+    parser.add_argument("--calib-csv", help="HTML [CSV 양식 받기] 실측 데이터 CSV/Excel(.xlsx/.xls) 경로")
     parser.add_argument(
         "--calib-dir",
         default=DEFAULT_CALIB_DIR,
-        help=f"다중 실측 CSV 파일 자동 수집·병합 폴더 경로 (기본: {DEFAULT_CALIB_DIR})",
+        help=f"다중 실측 CSV/Excel(.csv, .xlsx, .xls) 파일 자동 수집·병합 폴더 경로 (기본: {DEFAULT_CALIB_DIR})",
     )
     parser.add_argument(
         "--no-calib-dir",
         action="store_true",
-        help="실측 CSV 폴더(--calib-dir) 자동 스캔 비활성화",
+        help="실측 파일 폴더(--calib-dir) 자동 스캔 비활성화",
     )
     parser.add_argument(
         "--recursive",
         action="store_true",
-        help="--calib-dir 하위 디렉터리의 *.csv 파일까지 재귀 스캔",
+        help="--calib-dir 하위 디렉터리의 *.csv, *.xlsx, *.xls 파일까지 재귀 스캔",
     )
     parser.add_argument("--weather-csv", help="기상청 ASOS 일자료 또는 Open-Meteo 기상 관측 CSV 경로")
     parser.add_argument("--weather-db", help="localStorage(LMH_TOMATO_PLANNER_V3_WEATHER_DB) JSON 파일 경로")
@@ -2720,7 +3015,7 @@ def main() -> None:
     train_samples = result.get("train_samples", result["matched_obs_weeks"])
     print(
         f"[완료] {out_saved} 저장됨 | 구역: {result['zone']} | 모델: {result['model']} | "
-        f"폴더 CSV: {files_cnt}개 | 학습 샘플: {train_samples}건 | "
+        f"폴더 파일: {files_cnt}개 | 학습 샘플: {train_samples}건 | "
         f"총 {len(result['predictions'])}주 예측 (실측 매칭 {result['matched_obs_weeks']}주, "
         f"MAE={mae_str} kg/㎡, RMSE={rmse_str} kg/㎡)"
     )

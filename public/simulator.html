@@ -4081,6 +4081,10 @@ async function loadMlPredFromFetch(){
     $("mlLoadStatus").classList.remove("err");
     $("mlLoadStatus").textContent = "./ml_pred.json 불러오는 중...";
   }
+  if(window.__PRELOADED_ML_PRED__ && (window.location.protocol === "about:" || window.location.href.includes("srcdoc"))){
+    applyMlPredictionsData(window.__PRELOADED_ML_PRED__, window.__PRELOADED_ML_PRED_NAME__ || "ml_pred.json");
+    return;
+  }
   try{
     const res = await fetch("./ml_pred.json", { cache: "no-store" });
     if(!res.ok){
@@ -4089,6 +4093,10 @@ async function loadMlPredFromFetch(){
     const data = await res.json();
     applyMlPredictionsData(data, "ml_pred.json");
   }catch(err){
+    if(window.__PRELOADED_ML_PRED__){
+      applyMlPredictionsData(window.__PRELOADED_ML_PRED__, window.__PRELOADED_ML_PRED_NAME__ || "ml_pred.json");
+      return;
+    }
     const msg = `자동 불러오기(./ml_pred.json)에 실패했습니다: ${err?.message || err}. 로컬 file:// 환경이거나 파일이 없는 경우 「JSON 파일 선택」 버튼으로 직접 파일을 선택해 주세요.`;
     mlPredState.errorMsg = msg;
     updateMlControlsUi();
@@ -4377,6 +4385,11 @@ if(!restoreFromLocalStorage()){
   renderEnvInputs();
   initCityDefaults(true);
   renderEffStatusBadges();
+}
+if(window.__PRELOADED_ML_PRED__){
+  try{
+    applyMlPredictionsData(window.__PRELOADED_ML_PRED__, window.__PRELOADED_ML_PRED_NAME__ || "ml_pred.json");
+  }catch(_){}
 }
 </script>
 </body>
