@@ -951,8 +951,9 @@ footer{text-align:center;padding:24px 16px;color:#667c70;font-size:12px}
             <button id="pickMlJsonBtn" type="button" class="btn-ml">JSON 파일 선택</button>
             <input id="mlJsonInput" type="file" accept=".json,application/json" hidden>
             <button id="toggleMlPredBtn" type="button" class="btn-ml" disabled aria-pressed="true">ML 예측선 표시/숨김</button>
+            <button id="exportQuickMlBtn" type="button" class="btn-ml" disabled>간이 ML JSON 내보내기</button>
           </div>
-          <span id="mlLoadStatus" class="ml-status">외부 ML 예측 JSON(ml_pred.json)을 불러오면 주별 그래프에 겹쳐 표시됩니다.</span>
+          <span id="mlLoadStatus" class="ml-status">외부 ML 예측 JSON(ml_pred.json)을 불러오거나 실측 CSV를 업로드하면 주별 그래프에 겹쳐 표시됩니다.</span>
         </div>
         <div id="chartContainer"></div>
       </div>
@@ -1594,11 +1595,15 @@ let isPhysDirty = false;
 let mlPredState = {
   loaded: false,
   visible: true,
+  source: "",
   zone: "",
   model: "",
   fileName: "",
   byWeek: new Map(),
   rawCount: 0,
+  payload: null,
+  mae: null,
+  rmse: null,
   errorMsg: ""
 };
 
@@ -2596,9 +2601,11 @@ function computeMlMetrics(weekCount){
 
 function updateMlControlsUi(){
   const toggleBtn = $("toggleMlPredBtn");
+  const exportBtn = $("exportQuickMlBtn");
   const legendEl = $("mlLegendItem");
   const statusEl = $("mlLoadStatus");
   const showLine = mlPredState.loaded && mlPredState.visible;
+  const isQuick = mlPredState.source === "browser_calib_csv";
 
   if(toggleBtn){
     toggleBtn.disabled = !mlPredState.loaded;
@@ -2608,8 +2615,12 @@ function updateMlControlsUi(){
       ? "ML 예측선 표시/숨김"
       : (mlPredState.visible ? "ML 예측선 숨기기" : "ML 예측선 표시하기");
   }
+  if(exportBtn){
+    exportBtn.disabled = !(mlPredState.loaded && mlPredState.byWeek.size > 0);
+  }
   if(legendEl){
     legendEl.classList.toggle("hidden", !showLine);
+    legendEl.innerHTML = isQuick ? "&nbsp; ━ 간이 ML 보정선" : "&nbsp; ━ 정식 ML 예측선";
   }
   if(statusEl){
     if(mlPredState.errorMsg){
@@ -2617,17 +2628,20 @@ function updateMlControlsUi(){
       statusEl.textContent = mlPredState.errorMsg;
     } else if(mlPredState.loaded){
       statusEl.classList.remove("err");
+      const sourceLabel = isQuick ? "브라우저 간이 보정(실측 CSV 기반)" : "외부 정식 ML JSON";
       const tag = [mlPredState.zone, mlPredState.model].filter(Boolean).join(" · ") || mlPredState.fileName || "ML 모델";
       const metrics = computeMlMetrics(lastOrigSim?.harvest?.length || rows.length);
-      const errText = metrics.obsCount > 0
-        ? ` · 실측 ${metrics.obsCount}주 대비 MAE=${metrics.mae.toFixed(3)} / RMSE=${metrics.rmse.toFixed(3)} kg/㎡`
+      const dispMae = metrics.obsCount > 0 ? metrics.mae : mlPredState.mae;
+      const dispRmse = metrics.obsCount > 0 ? metrics.rmse : mlPredState.rmse;
+      const errText = Number.isFinite(dispMae) && Number.isFinite(dispRmse)
+        ? ` · 실측 ${metrics.obsCount || mlPredState.payload?.matched_obs_weeks || "-"}주 대비 MAE=${dispMae.toFixed(3)} / RMSE=${dispRmse.toFixed(3)} kg/㎡`
         : "";
       statusEl.textContent = mlPredState.visible
-        ? `ML 오버레이 중 [${tag}] (${metrics.matchedWeeks}/${mlPredState.byWeek.size}주 매칭${errText})`
-        : `ML 예측선 숨김 [${tag}] (${mlPredState.byWeek.size}주 로드됨)`;
+        ? `${sourceLabel} 오버레이 중 [${tag}] (${metrics.matchedWeeks}/${mlPredState.byWeek.size}주 매칭${errText})`
+        : `${sourceLabel} 숨김 [${tag}] (${mlPredState.byWeek.size}주 로드됨${errText})`;
     } else {
       statusEl.classList.remove("err");
-      statusEl.textContent = "외부 ML 예측 JSON(ml_pred.json)을 불러오면 주별 그래프에 겹쳐 표시됩니다.";
+      statusEl.textContent = "외부 ML 예측 JSON(ml_pred.json)을 불러오거나 실측 CSV를 업로드하면 주별 그래프에 겹쳐 표시됩니다.";
     }
   }
 }
@@ -2712,11 +2726,13 @@ function renderWeekly3CurveSvg(origRes, adjRes){
     if(mlSeg.length > 1) mlPath += `<polyline fill="none" stroke="#7c3aed" stroke-width="2.4" points="${mlSeg.join(' ')}"/>`;
 
     const mlMetrics = computeMlMetrics(n);
+    const isQuick = mlPredState.source === "browser_calib_csv";
+    const mlSourceBadge = isQuick ? "간이 ML 보정" : "정식 ML 예측";
     const mlTag = [mlPredState.zone, mlPredState.model].filter(Boolean).join(" · ") || mlPredState.fileName || "ML Model";
     const mlErrNote = mlMetrics.obsCount > 0
       ? ` · 실측 ${mlMetrics.obsCount}주 대비 ML MAE=${mlMetrics.mae.toFixed(3)} / RMSE=${mlMetrics.rmse.toFixed(3)} kg/㎡`
       : " · (실측치 입력 시 ML MAE/RMSE 자동 산출)";
-    mlHeaderText = `<text x="${padL}" y="31" font-size="11" fill="#6d28d9" font-weight="bold">ML 예측선 [${escHtml(mlTag)}] · ${mlMetrics.matchedWeeks}주 표시${mlErrNote}</text>`;
+    mlHeaderText = `<text x="${padL}" y="31" font-size="11" fill="#6d28d9" font-weight="bold">${mlSourceBadge} [${escHtml(mlTag)}] · ${mlMetrics.matchedWeeks}주 표시${mlErrNote}</text>`;
   }
 
   const cs = aRes.calibStats;
@@ -3031,6 +3047,9 @@ function runOriginalPreview(statusText){
     if(!lastAdjSim) lastAdjSim = origRes;
     $("errorBox").textContent = "";
     markPhysDirty(statusText || "3번 패널 DLI·광효율과 원본 광량 예측 수확량을 즉시 반영했습니다. 생리 보정 실질 수확량 반영은 보정 버튼을 눌러 주세요.");
+    if(mlPredState.source === "browser_calib_csv"){
+      applyQuickCalibratedMl(lastAdjSim || origRes, { preserveVisible: true, skipRender: true });
+    }
     renderDashboard(lastOrigSim, lastAdjSim);
     $("csvBtn").disabled = false;
   }catch(e){
@@ -3049,6 +3068,9 @@ function runSimulation(statusText){
     lastAdjSim = res;
     $("errorBox").textContent = "";
     clearPhysDirty();
+    if(mlPredState.source === "browser_calib_csv"){
+      applyQuickCalibratedMl(res, { preserveVisible: true, skipRender: true });
+    }
     renderDashboard(res, res);
     $("csvBtn").disabled = false;
     $("actionStatus").textContent = statusText || "최신 광량 시나리오·동적 T24 성숙일수·양방향 생리 보정(K_total)으로 우측 전체를 일괄 갱신했습니다.";
@@ -3558,6 +3580,17 @@ $("calibBody").oninput = e => {
   calibRows[i][key] = e.target.value === "" ? NaN : Number(e.target.value);
   if(key === "obsMj" || key === "obsT24"){
     runOriginalPreview(`${i+1}주차 실측 기상 입력을 모델에 반영했습니다. 생리 보정 확정은 보정 버튼을 눌러 주세요.`);
+  } else if(key === "obsKg"){
+    try{
+      const c = readConfig();
+      const baseRes = calculateMasterplan(c, rows, appliedEnvMonths, calibRows);
+      lastOrigSim = baseRes;
+      lastAdjSim = baseRes;
+      applyQuickCalibratedMl(baseRes, { forceOverride: true, skipRender: true });
+      renderDashboard(baseRes, baseRes);
+    }catch(_){
+      renderDashboard(lastOrigSim, lastAdjSim);
+    }
   } else {
     renderDashboard(lastOrigSim, lastAdjSim);
   }
@@ -3608,6 +3641,7 @@ $("applyCalibPasteBtn").onclick = () => {
     if(n === 0) throw Error("인식된 유효 주차 데이터가 없습니다. '주차, 실측수확량(kg/㎡), 단과중(g)' 형식을 확인하세요.");
     $("calibBody").dataset.count = "";
     runSimulation(`실측 데이터 ${n}개 주차를 불러와 MAE·RMSE 및 3곡선 대조 차트를 갱신했습니다.`);
+    applyQuickCalibratedMl(lastAdjSim || lastOrigSim, { forceOverride: true });
     saveStateToLocalStorage();
   }catch(e){
     $("errorBox").textContent = e.message;
@@ -3621,7 +3655,8 @@ $("calibCsvInput").onchange = async e => {
     if(!f) return;
     const n = parseCalibCsvText(await f.text());
     $("calibBody").dataset.count = "";
-    runSimulation(`CSV 파일에서 ${n}개 주차 실측 데이터를 불러왔습니다.`);
+    runSimulation(`CSV 파일에서 ${n}개 주차 실측 데이터를 불러와 간이 ML 보정 곡선을 즉시 오버레이했습니다.`);
+    applyQuickCalibratedMl(lastAdjSim || lastOrigSim, { forceOverride: true });
     saveStateToLocalStorage();
   }catch(err){
     $("errorBox").textContent = err.message;
@@ -3669,7 +3704,8 @@ $("loadSample16Btn").onclick = () => {
     }
   });
   $("calibBody").dataset.count = "";
-  runSimulation(`16작기 트러스트 품종 실측 예시 데이터(${filled}주)를 불러왔습니다. 이제 '자동 캘리브레이션' 버튼으로 광효율을 역산할 수 있습니다.`);
+  runSimulation(`16작기 트러스트 품종 실측 예시 데이터(${filled}주)를 불러와 간이 ML 보정 곡선을 즉시 표시했습니다.`);
+  applyQuickCalibratedMl(lastAdjSim || lastOrigSim, { forceOverride: true });
   saveStateToLocalStorage();
 };
 
@@ -3678,6 +3714,9 @@ $("clearCalibBtn").onclick = () => {
   $("calibPasteBox").value = "";
   $("calibBody").dataset.count = "";
   runSimulation("실측 검증 데이터를 초기화했습니다.");
+  if(mlPredState.source === "browser_calib_csv"){
+    clearBrowserQuickMlState();
+  }
   saveStateToLocalStorage();
 };
 
@@ -3794,6 +3833,190 @@ document.querySelectorAll("[data-chart-view]").forEach(btn => {
   };
 });
 
+function clearBrowserQuickMlState(opts={}){
+  mlPredState = {
+    loaded: false,
+    visible: true,
+    source: "",
+    zone: "",
+    model: "",
+    fileName: "",
+    byWeek: new Map(),
+    rawCount: 0,
+    payload: null,
+    mae: null,
+    rmse: null,
+    errorMsg: ""
+  };
+  if(!opts.skipRender){
+    if(lastOrigSim) renderChart(lastOrigSim, lastAdjSim);
+    else updateMlControlsUi();
+  }
+}
+
+function buildQuickCalibratedMlPayload(simRes, calibList){
+  if(!simRes || !Array.isArray(simRes.harvest) || simRes.harvest.length === 0) return null;
+
+  const matched = [];
+  simRes.harvest.forEach((h, i) => {
+    const ob = calibList?.[i];
+    if(ob && Number.isFinite(ob.obsKg) && ob.obsKg >= 0 && Number.isFinite(h.adjKg) && h.adjKg > 0.05){
+      matched.push({
+        idx: i,
+        wk: i + 1,
+        obsKg: ob.obsKg,
+        adjKg: h.adjKg,
+        ratio: ob.obsKg / h.adjKg,
+        diff: ob.obsKg - h.adjKg
+      });
+    }
+  });
+  if(matched.length === 0) return null;
+
+  const meanRatio = matched.reduce((s, m) => s + m.ratio, 0) / matched.length;
+  const recentSlice = matched.slice(-4);
+  const recentRatio = recentSlice.reduce((s, m) => s + m.ratio, 0) / recentSlice.length;
+  const blendedRatio = Math.max(0.50, Math.min(1.80, meanRatio * 0.65 + recentRatio * 0.35));
+  const meanDiff = matched.reduce((s, m) => s + m.diff, 0) / matched.length;
+  const lastObsWeek = matched[matched.length - 1].wk;
+
+  const cityRec = getCityRecord(active.city) || CITIES.nonsan;
+  const scLabel = isCustomCityId(active.city) ? "실측CSV" : (SCENARIO_LABELS[active.solarScenario] || "평년");
+  const zoneName = `${cityRec.name || active.city} (${scLabel})`;
+
+  const predictions = [];
+  let obsEvalCount = 0;
+  let sumAbs = 0;
+  let sumSq = 0;
+
+  simRes.harvest.forEach((h, i) => {
+    const wk = i + 1;
+    const startStr = fmtDate(h.at);
+    const ob = calibList?.[i];
+    const yActual = (ob && Number.isFinite(ob.obsKg) && ob.obsKg >= 0) ? Math.round(ob.obsKg * 10000) / 10000 : null;
+    const adjKg = Number.isFinite(h.adjKg) ? Math.max(0, h.adjKg) : 0;
+    const origKg = Number.isFinite(h.origKg) ? Math.max(0, h.origKg) : 0;
+    const det = simRes.detail?.[i];
+    const kTotalRaw = origKg > 1e-6 ? (adjKg / origKg) : (det?.phys?.ktotal ?? 1.0);
+    const dynLagRaw = h.dayCount > 0 ? h.avgLag : (det?.dynLag ?? simRes.c?.cropLag ?? 45);
+
+    let yHat = 0;
+    if(adjKg > 1e-6 || yActual !== null){
+      const stepsAfter = Math.max(0, wk - lastObsWeek);
+      const diffDecay = Math.exp(-0.20 * stepsAfter) * 0.25;
+      yHat = Math.max(0, adjKg * blendedRatio + meanDiff * diffDecay);
+    }
+    const yPredRounded = Math.round(yHat * 10000) / 10000;
+
+    if(yActual !== null){
+      const err = yPredRounded - yActual;
+      sumAbs += Math.abs(err);
+      sumSq += err * err;
+      obsEvalCount += 1;
+    }
+
+    predictions.push({
+      week: wk,
+      week_no: wk,
+      start: startStr,
+      date: startStr,
+      y_pred: yPredRounded,
+      pred: yPredRounded,
+      yield: yPredRounded,
+      y_actual: yActual,
+      orig_kg: Math.round(origKg * 10000) / 10000,
+      adj_kg: Math.round(adjKg * 10000) / 10000,
+      k_total: Math.round(kTotalRaw * 10000) / 10000,
+      dyn_lag: Math.round(dynLagRaw * 100) / 100
+    });
+  });
+
+  const mae = obsEvalCount > 0 ? Math.round((sumAbs / obsEvalCount) * 10000) / 10000 : null;
+  const rmse = obsEvalCount > 0 ? Math.round(Math.sqrt(sumSq / obsEvalCount) * 10000) / 10000 : null;
+
+  return {
+    zone: zoneName,
+    model: `Browser Quick-Calib (n=${matched.length}w, x${blendedRatio.toFixed(2)})`,
+    base_week: lastObsWeek,
+    matched_obs_weeks: matched.length,
+    mae,
+    rmse,
+    source: "browser_calib_csv",
+    predictions
+  };
+}
+
+function applyQuickCalibratedMl(simRes, opts={}){
+  if(!opts.forceOverride && mlPredState.source === "external_json") return false;
+  const payload = buildQuickCalibratedMlPayload(simRes, calibRows);
+  if(!payload){
+    if(mlPredState.source === "browser_calib_csv"){
+      clearBrowserQuickMlState({ skipRender: opts.skipRender });
+    }
+    return false;
+  }
+  const byWeek = new Map();
+  payload.predictions.forEach(item => {
+    byWeek.set(item.week, item.y_pred);
+  });
+  const nextVisible = (opts.preserveVisible && mlPredState.loaded) ? mlPredState.visible : true;
+  mlPredState = {
+    loaded: true,
+    visible: nextVisible,
+    source: "browser_calib_csv",
+    zone: payload.zone,
+    model: payload.model,
+    fileName: "ml_pred.json",
+    byWeek,
+    rawCount: payload.predictions.length,
+    payload,
+    mae: payload.mae,
+    rmse: payload.rmse,
+    errorMsg: ""
+  };
+  if(!opts.skipRender){
+    if(lastOrigSim) renderChart(lastOrigSim, lastAdjSim);
+    else updateMlControlsUi();
+  }
+  return true;
+}
+
+function buildExportableMlPayload(){
+  if(mlPredState.payload && Array.isArray(mlPredState.payload.predictions)) return mlPredState.payload;
+  if(!mlPredState.loaded || mlPredState.byWeek.size === 0) return null;
+  const sim = lastAdjSim || lastOrigSim;
+  const harv = sim?.harvest || [];
+  const metrics = computeMlMetrics(harv.length || rows.length);
+  const predictions = Array.from(mlPredState.byWeek.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([wk, yPred]) => {
+      const h = harv[wk - 1];
+      const ob = calibRows[wk - 1];
+      const startStr = h ? fmtDate(h.at) : "";
+      const rounded = Math.round(yPred * 10000) / 10000;
+      return {
+        week: wk,
+        week_no: wk,
+        start: startStr,
+        date: startStr,
+        y_pred: rounded,
+        pred: rounded,
+        yield: rounded,
+        y_actual: (ob && Number.isFinite(ob.obsKg)) ? Math.round(ob.obsKg * 10000) / 10000 : null,
+        orig_kg: h ? Math.round(h.origKg * 10000) / 10000 : null,
+        adj_kg: h ? Math.round(h.adjKg * 10000) / 10000 : null
+      };
+    });
+  return {
+    zone: mlPredState.zone || "",
+    model: mlPredState.model || "ML Model",
+    mae: Number.isFinite(metrics.mae) ? Math.round(metrics.mae * 10000) / 10000 : null,
+    rmse: Number.isFinite(metrics.rmse) ? Math.round(metrics.rmse * 10000) / 10000 : null,
+    source: mlPredState.source || "external_json",
+    predictions
+  };
+}
+
 function parseMlPredictionsJson(data, sourceLabel){
   const root = Array.isArray(data) ? { predictions: data } : data;
   if(!root || typeof root !== "object" || !Array.isArray(root.predictions)){
@@ -3804,7 +4027,8 @@ function parseMlPredictionsJson(data, sourceLabel){
     if(!item || typeof item !== "object") return;
     const rawWeek = item.week !== undefined ? item.week : item.week_no;
     const wNum = Math.round(Number(rawWeek));
-    const yPred = Number(item.y_pred);
+    const rawPred = item.y_pred !== undefined ? item.y_pred : (item.pred !== undefined ? item.pred : item.yield);
+    const yPred = Number(rawPred);
     if(Number.isFinite(wNum) && wNum >= 1 && Number.isFinite(yPred)){
       byWeek.set(wNum, Math.max(0, yPred));
     }
@@ -3813,11 +4037,15 @@ function parseMlPredictionsJson(data, sourceLabel){
     throw Error("유효한 주차(week 또는 week_no)와 예측값(y_pred) 데이터를 찾을 수 없습니다.");
   }
   return {
+    source: root.source === "browser_calib_csv" ? "browser_calib_csv" : "external_json",
     zone: typeof root.zone === "string" ? root.zone.trim() : "",
     model: typeof root.model === "string" ? root.model.trim() : "ML Model",
     fileName: sourceLabel || "ml_pred.json",
     byWeek,
-    rawCount: root.predictions.length
+    rawCount: root.predictions.length,
+    payload: root,
+    mae: Number.isFinite(Number(root.mae)) ? Number(root.mae) : null,
+    rmse: Number.isFinite(Number(root.rmse)) ? Number(root.rmse) : null
   };
 }
 
@@ -3826,11 +4054,15 @@ function applyMlPredictionsData(data, sourceLabel){
   mlPredState = {
     loaded: true,
     visible: true,
+    source: parsed.source,
     zone: parsed.zone,
     model: parsed.model,
     fileName: parsed.fileName,
     byWeek: parsed.byWeek,
     rawCount: parsed.rawCount,
+    payload: parsed.payload,
+    mae: parsed.mae,
+    rmse: parsed.rmse,
     errorMsg: ""
   };
   if(lastOrigSim) renderChart(lastOrigSim, lastAdjSim);
@@ -3838,7 +4070,7 @@ function applyMlPredictionsData(data, sourceLabel){
   if($("actionStatus")){
     $("actionStatus").style.color = "#5b21b6";
     const tag = [mlPredState.zone, mlPredState.model].filter(Boolean).join(" · ") || mlPredState.fileName;
-    $("actionStatus").textContent = `ML 예측 JSON(${tag}, ${mlPredState.byWeek.size}주)을 주별 그래프에 오버레이했습니다.`;
+    $("actionStatus").textContent = `외부 정식 ML 예측 JSON(${tag}, ${mlPredState.byWeek.size}주)을 주별 그래프에 오버레이했습니다.`;
   }
 }
 
@@ -3889,6 +4121,15 @@ if($("toggleMlPredBtn")) $("toggleMlPredBtn").onclick = () => {
   mlPredState.errorMsg = "";
   if(lastOrigSim) renderChart(lastOrigSim, lastAdjSim);
   else updateMlControlsUi();
+};
+if($("exportQuickMlBtn")) $("exportQuickMlBtn").onclick = () => {
+  const payload = buildExportableMlPayload();
+  if(!payload) return;
+  downloadFile("ml_pred.json", JSON.stringify(payload, null, 2), "application/json");
+  if($("actionStatus")){
+    $("actionStatus").style.color = "#5b21b6";
+    $("actionStatus").textContent = `현재 ${mlPredState.source === "browser_calib_csv" ? "브라우저 간이 보정" : "ML 예측"} 결과(${payload.predictions.length}주)를 ml_pred.json으로 내보냈습니다.`;
+  }
 };
 
 function downloadFile(name, content, mime){
@@ -4081,6 +4322,9 @@ function applySavedSnapshot(d, opts={}){
   $("weeklyBody").dataset.count = "";
   $("calibBody").dataset.count = "";
   runSimulation(opts.statusText || "저장된 계획 및 캘리브레이션 프리셋 파일을 불러와 시뮬레이션을 완료했습니다.");
+  if(!mlPredState.loaded || mlPredState.source === "browser_calib_csv"){
+    applyQuickCalibratedMl(lastAdjSim || lastOrigSim, { preserveVisible: mlPredState.source === "browser_calib_csv" });
+  }
   if(lastAdjSim && Number.isFinite(lastAdjSim.calibStats?.mae)){
     active.effMeta.mae = lastAdjSim.calibStats.mae;
   }
