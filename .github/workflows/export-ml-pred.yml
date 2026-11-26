@@ -1,0 +1,200 @@
+name: Export ML Yield Predictions
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan_path:
+        description: "HTML 저장 JSON 경로 (예: LMH-Tomato-Calibrated-Preset.json)"
+        required: false
+        default: ""
+        type: string
+      masterplan_csv:
+        description: "마스터플랜 CSV 경로 (예: 토마토_마스터플랜_v3_2027-01-01_2027-12-31.csv)"
+        required: false
+        default: ""
+        type: string
+      calib_csv:
+        description: "실측 입력 양식 CSV 경로 (예: 토마토_실측데이터_입력양식.csv)"
+        required: false
+        default: ""
+        type: string
+      weather_csv:
+        description: "기상 관측 CSV 경로 (ASOS 또는 Open-Meteo)"
+        required: false
+        default: ""
+        type: string
+      station:
+        description: "ASOS 다중 지점 사용 시 지점명 (예: 논산)"
+        required: false
+        default: ""
+        type: string
+      base_week:
+        description: "학습 기준 마지막 주차 (비워두면 실측 마지막 주차 자동 사용)"
+        required: false
+        default: ""
+        type: string
+      min_weeks:
+        description: "학습에 필요한 최소 실측 주차 수"
+        required: false
+        default: "4"
+        type: string
+
+  push:
+    paths-ignore:
+      - "public/ml_pred.json"
+      - "**.md"
+
+  schedule:
+    # 매일 새벽 06:00 KST (UTC 21:00) 주기 실행
+    - cron: "0 21 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: export-ml-pred-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  train-and-export-ml:
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'train_export_ml.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install numpy pandas scikit-learn
+
+      - name: Run train_export_ml.py and export public/ml_pred.json
+        env:
+          INPUT_PLAN: ${{ github.event.inputs.plan_path }}
+          INPUT_MASTERPLAN_CSV: ${{ github.event.inputs.masterplan_csv }}
+          INPUT_CALIB_CSV: ${{ github.event.inputs.calib_csv }}
+          INPUT_WEATHER_CSV: ${{ github.event.inputs.weather_csv }}
+          INPUT_STATION: ${{ github.event.inputs.station }}
+          INPUT_BASE_WEEK: ${{ github.event.inputs.base_week }}
+          INPUT_MIN_WEEKS: ${{ github.event.inputs.min_weeks }}
+        run: |
+          set -euo pipefail
+
+          ARGS=(-o public/ml_pred.json)
+
+          # 1) 수동 실행(workflow_dispatch) 입력 우선 적용
+          if [ -n "$INPUT_PLAN" ]; then
+            ARGS+=(--plan "$INPUT_PLAN")
+          fi
+          if [ -n "$INPUT_MASTERPLAN_CSV" ]; then
+            ARGS+=(--masterplan-csv "$INPUT_MASTERPLAN_CSV")
+          fi
+          if [ -n "$INPUT_CALIB_CSV" ]; then
+            ARGS+=(--calib-csv "$INPUT_CALIB_CSV")
+          fi
+          if [ -n "$INPUT_WEATHER_CSV" ]; then
+            ARGS+=(--weather-csv "$INPUT_WEATHER_CSV")
+          fi
+          if [ -n "$INPUT_STATION" ]; then
+            ARGS+=(--station "$INPUT_STATION")
+          fi
+          if [ -n "$INPUT_BASE_WEEK" ]; then
+            ARGS+=(--base-week "$INPUT_BASE_WEEK")
+          fi
+          if [ -n "$INPUT_MIN_WEEKS" ]; then
+            ARGS+=(--min-weeks "$INPUT_MIN_WEEKS")
+          fi
+
+          # 2) 자동 실행 시 루트 / public / data 디렉터리에서 입력 데이터 존재 여부 점검
+          HAS_EXPLICIT_INPUT=false
+          if [ -n "$INPUT_PLAN" ] || [ -n "$INPUT_MASTERPLAN_CSV" ] || [ -n "$INPUT_CALIB_CSV" ]; then
+            HAS_EXPLICIT_INPUT=true
+          fi
+
+          if [ "$HAS_EXPLICIT_INPUT" = false ]; then
+            FOUND_INPUT=""
+            for cand in \
+              "LMH-Tomato-Calibrated-Preset.json" \
+              "LMH-Tomato-Physiology-Plan-v3.json" \
+              "plan.json" \
+              "public/LMH-Tomato-Calibrated-Preset.json" \
+              "public/LMH-Tomato-Physiology-Plan-v3.json" \
+              "public/plan.json" \
+              "data/LMH-Tomato-Calibrated-Preset.json" \
+              "data/plan.json"; do
+              if [ -f "$cand" ]; then
+                FOUND_INPUT="$cand"
+                ARGS+=(--plan "$cand")
+                break
+              fi
+            done
+
+            if [ -z "$FOUND_INPUT" ]; then
+              shopt -s nullglob
+              mp_files=(토마토_마스터플랜_v3_*.csv public/토마토_마스터플랜_v3_*.csv data/토마토_마스터플랜_v3_*.csv)
+              if [ ${#mp_files[@]} -gt 0 ]; then
+                FOUND_INPUT="${mp_files[0]}"
+                ARGS+=(--masterplan-csv "$FOUND_INPUT")
+              fi
+              shopt -u nullglob
+            fi
+
+            if [ -z "$FOUND_INPUT" ]; then
+              for cand in \
+                "토마토_실측데이터_입력양식.csv" \
+                "public/토마토_실측데이터_입력양식.csv" \
+                "data/토마토_실측데이터_입력양식.csv"; do
+                if [ -f "$cand" ]; then
+                  FOUND_INPUT="$cand"
+                  ARGS+=(--calib-csv "$cand")
+                  break
+                fi
+              done
+            fi
+
+            if [ -z "$FOUND_INPUT" ] && [ ! -f "smartfarm_yield_swing.db" ] && [ ! -f "raw_yield_source.csv" ]; then
+              echo "::notice::리포지토리에 학습 입력 파일(LMH-Tomato-Calibrated-Preset.json, 토마토_마스터플랜_v3_*.csv, 토마토_실측데이터_입력양식.csv, smartfarm_yield_swing.db, raw_yield_source.csv)이 아직 없어 ML 예측 생성을 건너뜁니다."
+              exit 0
+            fi
+          fi
+
+          echo "Running: python train_export_ml.py ${ARGS[*]}"
+          python train_export_ml.py "${ARGS[@]}"
+
+      - name: Commit and push public/ml_pred.json
+        run: |
+          if [ ! -f public/ml_pred.json ]; then
+            echo "public/ml_pred.json 파일이 생성되지 않아 커밋을 건너뜁니다."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add public/ml_pred.json
+          if git diff --cached --quiet -- public/ml_pred.json; then
+            echo "public/ml_pred.json 변경 사항이 없어 커밋하지 않습니다."
+            exit 0
+          fi
+
+          git commit -m "chore(ml): update public/ml_pred.json [skip ci]"
+          git push
