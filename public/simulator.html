@@ -517,6 +517,25 @@ td input{width:68px;min-width:64px;padding:5px 6px;font-size:12px;text-align:rig
 .seg-group{display:inline-flex;gap:4px;background:#eef4ee;padding:3px;border-radius:8px;border:1px solid #cfe0d2}
 .seg-btn{padding:4px 10px;border:none;border-radius:6px;background:transparent;color:var(--forest);font-size:11.5px;font-weight:700}
 .seg-btn.active{background:var(--forest);color:#fff}
+.ml-toolbar{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  padding:8px 10px;
+  margin-bottom:10px;
+  background:#f7f5fc;
+  border:1px solid #dfd7f3;
+  border-radius:9px;
+}
+.ml-toolbar-btns{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.btn-ml{background:#fff;color:#5b21b6;border-color:#c4b5fd;font-size:12px;padding:6px 10px}
+.btn-ml:hover:not(:disabled){background:#efe9fe}
+.btn-ml.active{background:#7c3aed;color:#fff;border-color:#6d28d9}
+.btn-ml.active:hover:not(:disabled){background:#6d28d9}
+.ml-status{font-size:11.5px;color:#4c3875;font-weight:600;line-height:1.4}
+.ml-status.err{color:#a13724}
 .hidden{display:none}
 .chart-wrap{overflow:hidden;border:1px solid #e5ede6;border-radius:10px;padding:10px;background:#fcfefc;margin-bottom:10px}
 .chart-wrap:last-child{margin-bottom:0}
@@ -579,6 +598,8 @@ footer{text-align:center;padding:24px 16px;color:#667c70;font-size:12px}
   .header-badges .pill{min-height:36px}
   .header-badges button{flex:1 1 auto}
   .city-upload-row button,.tabs .tab-btn,.calib-toolbar .bar button{flex:1 1 auto}
+  .ml-toolbar-btns{width:100%}
+  .ml-toolbar-btns button{flex:1 1 auto}
   .seg-group{width:100%;display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}
   .seg-btn{padding:6px 4px;font-size:11.5px;min-height:38px}
   .stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
@@ -915,6 +936,7 @@ footer{text-align:center;padding:24px 16px;color:#667c70;font-size:12px}
               <span style="color:#3b6eb5;font-weight:700">--- 원본 예측</span> &nbsp;
               <span style="color:#1c674e;font-weight:700">━ 생리 보정</span> &nbsp;
               <span style="color:#8b4513;font-weight:700">● 실측 수확량</span>
+              <span id="mlLegendItem" class="hidden" style="color:#7c3aed;font-weight:700">&nbsp; ━ ML 예측선</span>
             </span>
             <span class="seg-group" role="group" aria-label="차트 보기 전환">
               <button type="button" class="seg-btn active" data-chart-view="both">통합 보기</button>
@@ -923,6 +945,15 @@ footer{text-align:center;padding:24px 16px;color:#667c70;font-size:12px}
             </span>
           </span>
         </h2>
+        <div class="ml-toolbar">
+          <div class="ml-toolbar-btns">
+            <button id="loadMlFetchBtn" type="button" class="btn-ml">ML JSON 불러오기</button>
+            <button id="pickMlJsonBtn" type="button" class="btn-ml">JSON 파일 선택</button>
+            <input id="mlJsonInput" type="file" accept=".json,application/json" hidden>
+            <button id="toggleMlPredBtn" type="button" class="btn-ml" disabled aria-pressed="true">ML 예측선 표시/숨김</button>
+          </div>
+          <span id="mlLoadStatus" class="ml-status">외부 ML 예측 JSON(ml_pred.json)을 불러오면 주별 그래프에 겹쳐 표시됩니다.</span>
+        </div>
         <div id="chartContainer"></div>
       </div>
 
@@ -1493,6 +1524,7 @@ const ENV_PRESETS = {
 };
 
 const $ = id => document.getElementById(id);
+const escHtml = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 const num = (v, d=2) => Number.isFinite(v) ? v.toLocaleString("ko-KR",{minimumFractionDigits:d,maximumFractionDigits:d}) : "-";
 function formatMassAuto(kgVal, opts={}){
   if(!Number.isFinite(kgVal)) return "-";
@@ -1559,6 +1591,16 @@ let appliedEnvMonths = ENV_PRESETS.standard.map(x=>({...x}));
 let lastOrigSim = null;
 let lastAdjSim = null;
 let isPhysDirty = false;
+let mlPredState = {
+  loaded: false,
+  visible: true,
+  zone: "",
+  model: "",
+  fileName: "",
+  byWeek: new Map(),
+  rawCount: 0,
+  errorMsg: ""
+};
 
 function dateValue(s){
   if(typeof s!=="string" || !/^\d{4}-\d{2}-\d{2}$/.test(s)) throw Error("날짜 형식(YYYY-MM-DD)을 확인하세요.");
@@ -2525,20 +2567,95 @@ function renderCalibTable(origRes, adjRes){
   }
 }
 
+function computeMlMetrics(weekCount){
+  if(!mlPredState.loaded) return { matchedWeeks: 0, obsCount: 0, mae: NaN, rmse: NaN };
+  let matchedWeeks = 0;
+  let obsCount = 0;
+  let sumAbs = 0;
+  let sumSq = 0;
+  const totalWeeks = Number.isInteger(weekCount) && weekCount > 0 ? weekCount : rows.length;
+  for(let i = 0; i < totalWeeks; i++){
+    const pred = mlPredState.byWeek.get(i + 1);
+    if(!Number.isFinite(pred)) continue;
+    matchedWeeks += 1;
+    const obs = calibRows[i]?.obsKg;
+    if(Number.isFinite(obs)){
+      const diff = pred - obs;
+      sumAbs += Math.abs(diff);
+      sumSq += diff * diff;
+      obsCount += 1;
+    }
+  }
+  return {
+    matchedWeeks,
+    obsCount,
+    mae: obsCount > 0 ? sumAbs / obsCount : NaN,
+    rmse: obsCount > 0 ? Math.sqrt(sumSq / obsCount) : NaN
+  };
+}
+
+function updateMlControlsUi(){
+  const toggleBtn = $("toggleMlPredBtn");
+  const legendEl = $("mlLegendItem");
+  const statusEl = $("mlLoadStatus");
+  const showLine = mlPredState.loaded && mlPredState.visible;
+
+  if(toggleBtn){
+    toggleBtn.disabled = !mlPredState.loaded;
+    toggleBtn.setAttribute("aria-pressed", String(showLine));
+    toggleBtn.classList.toggle("active", showLine);
+    toggleBtn.textContent = !mlPredState.loaded
+      ? "ML 예측선 표시/숨김"
+      : (mlPredState.visible ? "ML 예측선 숨기기" : "ML 예측선 표시하기");
+  }
+  if(legendEl){
+    legendEl.classList.toggle("hidden", !showLine);
+  }
+  if(statusEl){
+    if(mlPredState.errorMsg){
+      statusEl.classList.add("err");
+      statusEl.textContent = mlPredState.errorMsg;
+    } else if(mlPredState.loaded){
+      statusEl.classList.remove("err");
+      const tag = [mlPredState.zone, mlPredState.model].filter(Boolean).join(" · ") || mlPredState.fileName || "ML 모델";
+      const metrics = computeMlMetrics(lastOrigSim?.harvest?.length || rows.length);
+      const errText = metrics.obsCount > 0
+        ? ` · 실측 ${metrics.obsCount}주 대비 MAE=${metrics.mae.toFixed(3)} / RMSE=${metrics.rmse.toFixed(3)} kg/㎡`
+        : "";
+      statusEl.textContent = mlPredState.visible
+        ? `ML 오버레이 중 [${tag}] (${metrics.matchedWeeks}/${mlPredState.byWeek.size}주 매칭${errText})`
+        : `ML 예측선 숨김 [${tag}] (${mlPredState.byWeek.size}주 로드됨)`;
+    } else {
+      statusEl.classList.remove("err");
+      statusEl.textContent = "외부 ML 예측 JSON(ml_pred.json)을 불러오면 주별 그래프에 겹쳐 표시됩니다.";
+    }
+  }
+}
+
 function renderWeekly3CurveSvg(origRes, adjRes){
   const aRes = adjRes || origRes;
   const harv = origRes.harvest;
   const n = harv.length;
   if(n === 0) return "";
   const sameHarv = aRes.harvest.length === n && aRes.c.start === origRes.c.start && aRes.c.harvestEnd === origRes.c.harvestEnd;
+  const showMl = mlPredState.loaded && mlPredState.visible;
 
   let maxVal = 0.5;
   for(let i=0; i<n; i++){
-    maxVal = Math.max(maxVal, harv[i].origKg, sameHarv ? aRes.harvest[i].adjKg : 0, Number.isFinite(calibRows[i]?.obsKg) ? calibRows[i].obsKg : 0);
+    const mlVal = showMl ? mlPredState.byWeek.get(i + 1) : undefined;
+    maxVal = Math.max(
+      maxVal,
+      harv[i].origKg,
+      sameHarv ? aRes.harvest[i].adjKg : 0,
+      Number.isFinite(calibRows[i]?.obsKg) ? calibRows[i].obsKg : 0,
+      Number.isFinite(mlVal) ? mlVal : 0
+    );
   }
   maxVal *= 1.15;
 
-  const w = 920, h = 275, padL = 54, padR = 24, padT = 28, padB = 40;
+  const w = 920, padL = 54, padR = 24, padB = 40;
+  const padT = showMl ? 42 : 28;
+  const h = showMl ? 289 : 275;
   const plotW = w - padL - padR, plotH = h - padT - padB;
   const x = i => padL + (n === 1 ? plotW / 2 : (i / (n - 1)) * plotW);
   const y = v => padT + plotH - (v / maxVal) * plotH;
@@ -2576,19 +2693,48 @@ function renderWeekly3CurveSvg(origRes, adjRes){
   }
   if(curSeg.length > 1) obsPath += `<polyline fill="none" stroke="#8b4513" stroke-width="2.5" points="${curSeg.join(' ')}"/>`;
 
+  let mlPath = "";
+  let mlDots = "";
+  let mlHeaderText = "";
+  if(showMl){
+    let mlSeg = [];
+    for(let i=0; i<n; i++){
+      const mv = mlPredState.byWeek.get(i + 1);
+      if(Number.isFinite(mv)){
+        const pt = `${x(i).toFixed(1)},${y(mv).toFixed(1)}`;
+        mlSeg.push(pt);
+        mlDots += `<circle cx="${x(i).toFixed(1)}" cy="${y(mv).toFixed(1)}" r="3.2" fill="#7c3aed" stroke="#fff" stroke-width="1"/>`;
+      } else if(mlSeg.length > 0){
+        if(mlSeg.length > 1) mlPath += `<polyline fill="none" stroke="#7c3aed" stroke-width="2.4" points="${mlSeg.join(' ')}"/>`;
+        mlSeg = [];
+      }
+    }
+    if(mlSeg.length > 1) mlPath += `<polyline fill="none" stroke="#7c3aed" stroke-width="2.4" points="${mlSeg.join(' ')}"/>`;
+
+    const mlMetrics = computeMlMetrics(n);
+    const mlTag = [mlPredState.zone, mlPredState.model].filter(Boolean).join(" · ") || mlPredState.fileName || "ML Model";
+    const mlErrNote = mlMetrics.obsCount > 0
+      ? ` · 실측 ${mlMetrics.obsCount}주 대비 ML MAE=${mlMetrics.mae.toFixed(3)} / RMSE=${mlMetrics.rmse.toFixed(3)} kg/㎡`
+      : " · (실측치 입력 시 ML MAE/RMSE 자동 산출)";
+    mlHeaderText = `<text x="${padL}" y="31" font-size="11" fill="#6d28d9" font-weight="bold">ML 예측선 [${escHtml(mlTag)}] · ${mlMetrics.matchedWeeks}주 표시${mlErrNote}</text>`;
+  }
+
   const cs = aRes.calibStats;
   const errNote = cs && cs.count > 0 ? ` · 실측 ${cs.count}주 MAE=${cs.mae.toFixed(3)} / RMSE=${cs.rmse.toFixed(3)} kg/㎡` : " · [실측 검증 탭에서 실측치 입력 시 갈색 실선 자동 오버레이]";
 
   return `
     <div class="chart-wrap">
-      <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="주별 수확량 3곡선 대조 그래프">
+      <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="주별 수확량 비교 그래프">
         <text x="${padL}" y="16" font-size="11.5" fill="#456155" font-weight="bold">주별 수확량 추이 대조 (kg/㎡·주)${errNote}</text>
+        ${mlHeaderText}
         ${grid}
         ${xTicks}
         <polyline fill="none" stroke="#3b6eb5" stroke-width="2" stroke-dasharray="6,4" points="${origPts}"/>
         ${adjPts ? `<polyline fill="none" stroke="#1c674e" stroke-width="2.6" opacity="${isPhysDirty?0.65:1}" points="${adjPts}"/>` : ""}
         ${obsPath}
         ${obsDots}
+        ${mlPath}
+        ${mlDots}
       </svg>
     </div>`;
 }
@@ -2678,6 +2824,7 @@ function renderChart(origRes, adjRes){
   if(view === "both" || view === "weekly3") html += renderWeekly3CurveSvg(origRes, adjRes);
   if(view === "both" || view === "monthlyBar") html += renderMonthlyBarSvg(origRes, adjRes);
   $("chartContainer").innerHTML = html;
+  updateMlControlsUi();
 }
 
 function renderDashboard(origRes, adjRes){
@@ -3646,6 +3793,103 @@ document.querySelectorAll("[data-chart-view]").forEach(btn => {
     if(lastOrigSim) renderChart(lastOrigSim, lastAdjSim);
   };
 });
+
+function parseMlPredictionsJson(data, sourceLabel){
+  const root = Array.isArray(data) ? { predictions: data } : data;
+  if(!root || typeof root !== "object" || !Array.isArray(root.predictions)){
+    throw Error("predictions 배열이 포함된 올바른 ML 예측 JSON 형식이 아닙니다.");
+  }
+  const byWeek = new Map();
+  root.predictions.forEach(item => {
+    if(!item || typeof item !== "object") return;
+    const rawWeek = item.week !== undefined ? item.week : item.week_no;
+    const wNum = Math.round(Number(rawWeek));
+    const yPred = Number(item.y_pred);
+    if(Number.isFinite(wNum) && wNum >= 1 && Number.isFinite(yPred)){
+      byWeek.set(wNum, Math.max(0, yPred));
+    }
+  });
+  if(byWeek.size === 0){
+    throw Error("유효한 주차(week 또는 week_no)와 예측값(y_pred) 데이터를 찾을 수 없습니다.");
+  }
+  return {
+    zone: typeof root.zone === "string" ? root.zone.trim() : "",
+    model: typeof root.model === "string" ? root.model.trim() : "ML Model",
+    fileName: sourceLabel || "ml_pred.json",
+    byWeek,
+    rawCount: root.predictions.length
+  };
+}
+
+function applyMlPredictionsData(data, sourceLabel){
+  const parsed = parseMlPredictionsJson(data, sourceLabel);
+  mlPredState = {
+    loaded: true,
+    visible: true,
+    zone: parsed.zone,
+    model: parsed.model,
+    fileName: parsed.fileName,
+    byWeek: parsed.byWeek,
+    rawCount: parsed.rawCount,
+    errorMsg: ""
+  };
+  if(lastOrigSim) renderChart(lastOrigSim, lastAdjSim);
+  else updateMlControlsUi();
+  if($("actionStatus")){
+    $("actionStatus").style.color = "#5b21b6";
+    const tag = [mlPredState.zone, mlPredState.model].filter(Boolean).join(" · ") || mlPredState.fileName;
+    $("actionStatus").textContent = `ML 예측 JSON(${tag}, ${mlPredState.byWeek.size}주)을 주별 그래프에 오버레이했습니다.`;
+  }
+}
+
+async function loadMlPredFromFetch(){
+  if($("errorBox")) $("errorBox").textContent = "";
+  mlPredState.errorMsg = "";
+  if($("mlLoadStatus")){
+    $("mlLoadStatus").classList.remove("err");
+    $("mlLoadStatus").textContent = "./ml_pred.json 불러오는 중...";
+  }
+  try{
+    const res = await fetch("./ml_pred.json", { cache: "no-store" });
+    if(!res.ok){
+      throw Error(`HTTP ${res.status} (${res.statusText || "파일 없음"})`);
+    }
+    const data = await res.json();
+    applyMlPredictionsData(data, "ml_pred.json");
+  }catch(err){
+    const msg = `자동 불러오기(./ml_pred.json)에 실패했습니다: ${err?.message || err}. 로컬 file:// 환경이거나 파일이 없는 경우 「JSON 파일 선택」 버튼으로 직접 파일을 선택해 주세요.`;
+    mlPredState.errorMsg = msg;
+    updateMlControlsUi();
+    if($("errorBox")) $("errorBox").textContent = msg;
+  }
+}
+
+if($("loadMlFetchBtn")) $("loadMlFetchBtn").onclick = loadMlPredFromFetch;
+if($("pickMlJsonBtn")) $("pickMlJsonBtn").onclick = () => $("mlJsonInput")?.click();
+if($("mlJsonInput")) $("mlJsonInput").onchange = async (e) => {
+  const f = e.target.files?.[0];
+  if(!f) return;
+  try{
+    if($("errorBox")) $("errorBox").textContent = "";
+    const text = await f.text();
+    const data = JSON.parse(text);
+    applyMlPredictionsData(data, f.name);
+  }catch(err){
+    const msg = `ML JSON 파일 불러오기 실패(${f.name}): ${err?.message || err}`;
+    mlPredState.errorMsg = msg;
+    updateMlControlsUi();
+    if($("errorBox")) $("errorBox").textContent = msg;
+  }finally{
+    e.target.value = "";
+  }
+};
+if($("toggleMlPredBtn")) $("toggleMlPredBtn").onclick = () => {
+  if(!mlPredState.loaded) return;
+  mlPredState.visible = !mlPredState.visible;
+  mlPredState.errorMsg = "";
+  if(lastOrigSim) renderChart(lastOrigSim, lastAdjSim);
+  else updateMlControlsUi();
+};
 
 function downloadFile(name, content, mime){
   const url = URL.createObjectURL(new Blob([content], {type:mime}));
